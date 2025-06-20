@@ -1,0 +1,11 @@
+numpy==1.21.5
+pure-python-adb
+pyyaml>=6.0
+opencv-python>=4.5.4
+protobuf==4.22.1
+bosdyn-api==5.0.0
+bosdyn-client==5.0.0
+bosdyn-core==5.0.0
+bosdyn-mission==5.0.0
+bosdyn-choreography-client==5.0.0
+bosdyn-orbit==5.0.0
