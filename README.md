@@ -76,7 +76,7 @@ Follow guidelines here in [`OculusReader`](https://github.com/rail-berkeley/ocul
 
 ## How to run
 1. Make sure to be able to run [reader.py](reader.py) before controlling spot.
-2. Run `python3 control_spot.py` to start controlling spot.
+2. Run `python3 teleop_spot.py` to start controlling spot.
 
 
 ## .npz file structure
