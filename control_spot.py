@@ -28,7 +28,10 @@ from bosdyn.client.math_helpers  import SE3Pose, Quat
 from bosdyn.client.frame_helpers import get_a_tform_b, VISION_FRAME_NAME
 
 from reader import OculusReader
-from utils import mat_to_se3, reaxis, rot_to_quat
+from demo_recorder import DemoRecorder
+from utils.spot_utils import mat_to_se3, reaxis, rot_to_quat, proto_to_cv2, image_to_cv
+from spot_images import SpotImages
+import logging, cv2
 
 
 class SpotVRTeleop:
@@ -38,7 +41,9 @@ class SpotVRTeleop:
     ARM_SCALE = 2.0          # [m per m] controller-to-arm translation
     VELOCITY_CMD_DURATION = 0.2  # seconds
 
-    def __init__(self, robot_ip, username, password, meta_quest_ip=None):
+    def __init__(self, robot_ip, username, password, meta_quest_ip=None, demo_image_preview=True):
+        self.oculus_reader = OculusReader(ip_address=meta_quest_ip)
+
         sdk = create_standard_sdk("spot-teleop")
         self.robot = sdk.create_robot(robot_ip)
         self.robot.authenticate(username, password)
@@ -65,6 +70,18 @@ class SpotVRTeleop:
         self.command_client   = self.robot.ensure_client("robot-command")
         self.state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
 
+
+        self.image_client = self.robot.ensure_client(ImageClient.default_service_name)
+        self.gripper_cam_param_client = self.robot.ensure_client(GripperCameraParamClient.default_service_name)
+        self.logger = logging.getLogger()
+        self.spot_images = SpotImages(
+            self.robot,
+            self.logger,
+            self.image_client,
+            self.gripper_cam_param_client
+        )
+
+
         # ---- runtime vars ---
         self.arm_anchor_ctrl  = None   # 4×4 SE(3) when grip first pressed
         self.arm_anchor_robot = None   # SE3Pose   ^ … corresponding robot pose
@@ -72,10 +89,10 @@ class SpotVRTeleop:
         self.base_enabled     = False
 
         self.stowed = False  # arm stowed at start
+        self.demo_image_preview = demo_image_preview  # show camera preview in demo mode1
 
         signal.signal(signal.SIGINT, self._clean_shutdown)
 
-        self.oculus_reader = OculusReader(ip_address=meta_quest_ip)
 
         # ── POWER ON ───────────────────────────────
         if not self.robot.is_powered_on():
@@ -85,13 +102,51 @@ class SpotVRTeleop:
 
         self.dock_id = get_dock_id(self.robot)
 
+        self.recorder = DemoRecorder(
+            robot=self.robot,
+            spot_images=self.spot_images,
+            state_client=self.state_client,
+            out_dir="demos",
+            fps=10,
+            preview=self.demo_image_preview)
+
     def get_meta_quest(self):
         return self.oculus_reader.get_transformations_and_buttons()
 
+    def undock(self):
+        try:
+            self.dock_id = get_dock_id(self.robot)
+            if self.dock_id is not None:
+                print(f"Robot is docked at {self.dock_id} → undocking …")
+                blocking_undock(self.robot, timeout=20)
+                self.dock_id = get_dock_id(self.robot)
+                print("Robot undocked.")
+                return True
+            else:
+                print("Robot is not docked.")
+                return False
+        except Exception as e:
+            print(f"[!] Error during undocking: {e}")
+            return False
+    def dock(self):
+        try:
+            self.dock_id = get_dock_id(self.robot)
+            if self.dock_id is None:
+                print("Robot is undocked → docking ...")
+                # Stand before trying to dock.
+                blocking_stand(self.command_client, timeout_sec=10)
+                blocking_dock_robot(self.robot, dock_id=520, timeout=30)
+                self.dock_id = get_dock_id(self.robot)
+                print(f"Robot docked at id={self.dock_id} and powered off.")
+                return True
+            else:
+                print(f"Robot is already docked at {self.dock_id}.")
+                return False
+        except Exception as e:
+            print(f"[!] Error during docking: {e}")
+            return False
 
     def dock_undock(self):
-
-        # docking_client = self.robot.ensure_client(DockingClient.default_service_name)
         try:
             self.dock_id = get_dock_id(self.robot)
             if self.dock_id is not None:
@@ -178,6 +233,20 @@ class SpotVRTeleop:
         t_prev = time.time()
         
         while True:
+            # --- Camera preview (runs every loop; throttle if needed) -------------
+            # try:
+            #     img_resp = self.spot_images.get_rgb_image("hand_color_image")   # pick any getter you like
+            #     if img_resp is not None:
+            #         frame = image_to_cv(img_resp)
+            #         cv2.imshow("Hand", frame)
+            #         cv2.waitKey(1)      # keeps the window responsive
+            # except Exception as e:
+            #     print(f"[!] Could not display image: {e}")
+
+            # state = self.state_client.get_robot_state()  # keep state fresh
+            # print(f"Robot state: {state}")
+
+
             poses, buttons = self.get_meta_quest()
 
             if len(poses) == 0 or len(buttons) == 0:
@@ -191,8 +260,8 @@ class SpotVRTeleop:
                 self.dock_undock()
             if buttons.get('B', False):
                 # self.sit()
-                self._clean_shutdown()
-                break
+                # self._clean_shutdown()
+                self.recorder.start() if not self.recorder.is_recording else self.recorder.stop()
 
             # ---------------- BASE  (LEFT HAND) -------------------
             lgrip  = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
@@ -211,17 +280,18 @@ class SpotVRTeleop:
 
             # ---------------- ARM   (RIGHT HAND) -------------------
             try:
-                rgrip = buttons.get('rightGrip', (0.0,))[0] > 0.5 or buttons.get('RG', False)
+                lgrip = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
+                # rTrig = buttons.get('rightTrig', (0.0,))[0]
                 rmat_raw  = poses['r']
                 # Meta Quest arm frame has z-down, x-right coordinate system.
                 # Reaxis to convert to robot hand frame: x-forward, y-left, z-up
                 rmat = reaxis(rmat_raw)
 
-                if rgrip and not self.prev_r_grip:
+                if lgrip and not self.prev_r_grip:
                     # first frame with grip pressed -> anchor
                     self.arm_anchor_ctrl  = rmat.copy()
                     self.arm_anchor_robot = self._current_ee_pose()
-                if rgrip:
+                if lgrip:
                     self.stowed = False  # arm is unstowed when moving arm
                     # Cartesian delta = anchor^{-1} * current
                     # Compute controller delta in anchor frame
@@ -236,7 +306,7 @@ class SpotVRTeleop:
 
                     self.move_arm_to(goal)
 
-                self.prev_r_grip = rgrip
+                self.prev_r_grip = lgrip
             except Exception as e:
                 print(f"[!] Error sending arm command: {e}")
 
@@ -247,7 +317,7 @@ class SpotVRTeleop:
                 self.unstow_arm()
 
             # ---------------- GRIPPER TRIGGER ----------------------
-            trigger_val = buttons.get('rightTrig', (0.0,))[0]
+            trigger_val = 1- buttons.get('rightTrig', (0.0,))[0] # use reverse of left trigger
             grip_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(trigger_val)
             self.command_client.robot_command(grip_cmd)
 
@@ -255,6 +325,9 @@ class SpotVRTeleop:
             sleep = max(0.0, dt - (time.time() - t_prev))
             time.sleep(sleep)
             t_prev = time.time()
+
+            if self.demo_image_preview:
+                self.recorder.poll_preview()
 
     # ---------------------------------------------------------------------#
     #      HELPERS                                                         #
@@ -283,7 +356,8 @@ def main():
     print(f"Connecting to Spot at {robot_ip} ...")
     print(f"user: {user}, password: {password}")
 
-    teleop = SpotVRTeleop(robot_ip, user, password, meta_quest_ip= "192.168.1.54")
+    meta_ip = "192.168.1.37"
+    teleop = SpotVRTeleop(robot_ip, user, password, meta_quest_ip= meta_ip, demo_image_preview=False)
     teleop.run()
 
 if __name__ == "__main__":
