@@ -11,7 +11,7 @@ Remote-operate Spot’s base, arm and gripper with natural 6-DoF hand motions.
 | **Anchor-and-delta control** | Hold grip → anchor pose; move hand → end-effector follows, 30 Hz. |
 | **Safe start-up / shutdown** | Script auto-acquires lease, clears Keepalive & Estop, undocks, stands, and power-offs cleanly. |
 | **No ROS, no Unity** | Pure Python 3.10 on top of official `bosdyn-client == 5.0.0`. |
-| **Quest 3 tracking pipeline** | Uses [`OculusReader`](https://github.com/OculusQuestCode/OculusReader) for sub-10 ms pose streaming. |
+| **Quest 3 tracking pipeline** | Uses [`OculusReader`](https://github.com/rail-berkeley/oculus_reader) for sub-10 ms pose streaming. |
 
 ---
 
@@ -72,8 +72,49 @@ echo $BOSDYN_CLIENT_PASSWORD
 
 
 ## Setup Meta controller
-Follow guidelines here in [`OculusReader`](https://github.com/OculusQuestCode/OculusReader) repo for setting up Meta Quest Controller over WiFi or USB.
+Follow guidelines here in [`OculusReader`](https://github.com/rail-berkeley/oculus_reader) repo for setting up Meta Quest Controller over WiFi or USB.
 
 ## How to run
 1. Make sure to be able to run [reader.py](reader.py) before controlling spot.
 2. Run `python3 control_spot.py` to start controlling spot.
+
+
+## .npz file structure
+
+Each saved .npz contains one “session” dictionary with the following keys:
+
+
+| Key                   | Shape                 | Description                                                                        |
+| --------------------- | --------------------- | ---------------------------------------------------------------------------------- |
+| **images**            | `(N,)` (dtype=object) | A length‑N array of OpenCV BGR frames; each element is an `HxW×3` `uint8` ndarray. |
+| **arm\_joint\_names** | `(J,)` (dtype=`<U…`)  | The J joint‐names (strings) for all recorded “arm0.\*” joints.                     |
+| **arm\_q**            | `(N, J)` (float32)    | Joint positions at each timestep.                                                  |
+| **arm\_dq**           | `(N, J)` (float32)    | Joint velocities at each timestep.                                                 |
+| **ee\_pose**          | `(N, 7)` (float32)    | End‑effector pose in body frame: `[tx,ty,tz,qx,qy,qz,qw]`.                         |
+| **vision\_in\_body**  | `(N, 7)` (float32)    | Vision‑frame origin expressed in body frame (same format as `ee_pose`).            |
+| **body\_vel**         | `(N, 6)` (float32)    | Body linear & angular velocity in vision frame: `[vx,vy,vz,wx,wy,wz]`.             |
+| **gripper**           | `(N, 1)` (float32)    | Gripper opening percentage.                                                        |
+| **ee\_force**         | `(N, 3)` (float32)    | Estimated end‑effector force vector in hand.                                       |
+| **t**                 | `(N, 1)` (float64)    | Timestamp for each capture, in seconds (including fractional).                     |
+
+## 📂 Dataset Structure (.h5)
+The dataset is organized in the following hierarchy:
+
+```text
+arm_joint_names                (shape=(7,), dtype=|S8)
+demo_0/
+├── actions                    (shape=(N, 10), dtype=float32)
+└── obs/
+    ├── arm_dq                 (shape=(N, 7), dtype=float32)
+    ├── arm_q                  (shape=(N, 7), dtype=float32)
+    ├── body_vel               (shape=(N, 6), dtype=float32)
+    ├── ee_force               (shape=(N, 3), dtype=float32)
+    ├── eef_pos                (shape=(N, 3), dtype=float32)
+    ├── eef_quat               (shape=(N, 4), dtype=float32)
+    ├── gripper                (shape=(N, 1), dtype=float32)
+    ├── images_0               (shape=(N, 480, 640, 3), dtype=uint8)
+    ├── t                      (shape=(N, 1), dtype=float32)
+    └── vision_in_body         (shape=(N, 7), dtype=float32)
+demo_1/
+...
+demo_N/
