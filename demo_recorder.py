@@ -26,7 +26,7 @@ def _clean_shutdown(self, *a):
     ...
 """
 from __future__ import annotations
-import time, threading, playsound
+import time, threading, subprocess
 import numpy as np
 import cv2
 from pathlib import Path
@@ -34,50 +34,14 @@ from typing import Dict, Optional, List
 
 from bosdyn.api import image_pb2, geometry_pb2
 from bosdyn.client import math_helpers
+from utils.spot_utils import pose_to_vec, frame_pose, image_to_cv
 
 
-# ------------------------------------------------------------------ #
-#  Low-level helpers                                                 #
-# ------------------------------------------------------------------ #
-
-def _image_to_cv(img_resp: image_pb2.ImageResponse) -> np.ndarray:
-    """Robustly convert any Spot ImageResponse to an OpenCV ndarray."""
-    img = img_resp.shot.image
-    rows, cols = img.rows, img.cols
-    fmt        = img_resp.shot.image.format
-    pxfmt      = img.pixel_format
-
-    # -- JPEG (always color) ----------------------------------------
-    if fmt == image_pb2.Image.FORMAT_JPEG:
-        buf = np.frombuffer(img.data, dtype=np.uint8)
-        return cv2.imdecode(buf, cv2.IMREAD_COLOR)  # already BGR
-
-    # -- RAW --------------------------------------------------------
-    chan = len(img.data) // (rows * cols)
-    if pxfmt == image_pb2.Image.PIXEL_FORMAT_DEPTH_U16:
-        return np.frombuffer(img.data, dtype=np.uint16).reshape(rows, cols)
-
-    if chan == 1:
-        gray = np.frombuffer(img.data, dtype=np.uint8).reshape(rows, cols)
-        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-    if chan == 3:
-        rgb  = np.frombuffer(img.data, dtype=np.uint8).reshape(rows, cols, 3)
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-    raise ValueError(f"Unhandled pixel format {pxfmt} (channels={chan})")
-
-def _frame_pose(snapshot, child: str) -> Optional[geometry_pb2.SE3Pose]:
-    """Return Pose of *child* in its declared parent frame; None if missing."""
-    edge = snapshot.child_to_parent_edge_map.get(child)
-    return edge.parent_tform_child if edge else None
-
-def _pose_to_vec(pose: geometry_pb2.SE3Pose) -> np.ndarray:
-    """SE3Pose -> 7-vector [tx,ty,tz,qx,qy,qz,qw]"""
-    t = pose.position
-    q = pose.rotation
-    return np.array([t.x, t.y, t.z, q.x, q.y, q.z, q.w], dtype=np.float32)
-
+def play_sound(path: str, block = False):
+    # -q = quiet, removes console output; omit if you want to see mpg123 logs
+    player = subprocess.Popen(["mpg123", "-q", "media/start.mp3"])
+    if block:
+        player.wait()
 
 # ------------------------------------------------------------------ #
 #  Recorder                                                          #
@@ -121,7 +85,10 @@ class DemoRecorder:
     def start(self):
         if self._thread.is_alive():
             print("[DemoRecorder] Already running.")
-            playsound.playsound('media/denied.mp3')
+            try:
+                play_sound('media/denied.mp3')
+            except Exception as e:
+                print(f"[DemoRecorder] Play sound error: {e}")
             return
         # clear old buffers
         self._frames.clear()
@@ -129,7 +96,10 @@ class DemoRecorder:
         self._joint_names = None
         self._stop_evt.clear()
         self._thread = threading.Thread(target=self._worker, daemon=True)
-        playsound.playsound('media/start.mp3', block=True)
+        try:
+            play_sound('media/start.mp3', block=True)
+        except Exception as e:
+                print(f"[DemoRecorder] Play sound error: {e}")
         self._thread.start()
 
         self.is_recording = True
@@ -142,12 +112,18 @@ class DemoRecorder:
         self._thread.join(timeout=2.0)
         if self._thread.is_alive():
             print("[DemoRecorder] WARNING: worker did not exit—forcing shutdown.")
+        try:
+            play_sound('media/stop.mp3')
+        except Exception as e:
+                print(f"[DemoRecorder] Play sound error: {e}")
 
-        playsound.playsound('media/stop.mp3', block=False)
         self._flush_to_disk()
         self.is_recording = False
         print("[DemoRecorder] Stopped and saved session.")
-        playsound.playsound('media/saved.mp3')
+        try:
+            play_sound('media/saved.mp3')
+        except Exception as e:
+                print(f"[DemoRecorder] Play sound error: {e}")
 
     def poll_preview(self):
         """Call this periodically from the main thread to show the latest frame."""
@@ -180,7 +156,7 @@ class DemoRecorder:
                 continue
             next_t += period
             try:
-                frame = _image_to_cv(self.spot_images.get_hand_rgb_image())
+                frame = image_to_cv(self.spot_images.get_hand_rgb_image())
                 state = self.state_client.get_robot_state()
                 self._frames.append(frame)
                 vecs  = self._extract_state(state)
@@ -210,13 +186,13 @@ class DemoRecorder:
             self._joint_names = np.array(names)
 
         # 2. Hand pose in body frame
-        hand_pose = _frame_pose(snapshot, "hand")
-        hand_vec = _pose_to_vec(hand_pose) if hand_pose else np.zeros(7, np.float32)
+        hand_pose = frame_pose(snapshot, "hand")
+        hand_vec = pose_to_vec(hand_pose) if hand_pose else np.zeros(7, np.float32)
 
         # --- vision←body pose -------------------------------------------
-        vision_in_body = _frame_pose(snapshot, "vision")     # vision expressed in body frame
+        vision_in_body = frame_pose(snapshot, "vision")     # vision expressed in body frame
         if vision_in_body:
-            vis_vec = _pose_to_vec(vision_in_body)
+            vis_vec = pose_to_vec(vision_in_body)
         else:
             vis_vec = np.zeros(7, np.float32)
 
@@ -228,7 +204,7 @@ class DemoRecorder:
 
         # --- gripper & wrench -------------------------------------------
         man      = state.manipulator_state
-        gripper  = np.array([man.gripper_open_percentage], dtype=np.float32)
+        gripper  = np.array([man.gripper_open_percentage/100.0], dtype=np.float32)
         wrench   = np.array([
               man.estimated_end_effector_force_in_hand.x,
               man.estimated_end_effector_force_in_hand.y,
@@ -252,7 +228,7 @@ class DemoRecorder:
     # ---------------- disk writer -------------------------------------- #
     def _flush_to_disk(self):
         if not self._frames:
-            print("[DemoRecorder] Nothing captured – no file written.")
+            print("[DemoRecorder] Nothing captured - no file written.")
             return
 
         # build session dict
@@ -265,7 +241,8 @@ class DemoRecorder:
 
         # choose next chronological file name
         existing = list(self.out_dir.glob("*.npz"))
-        idx      = max(int(existing.stem)) + 1 if existing else 0
+        nums     = [int(p.stem) for p in existing if p.stem.isdigit()]
+        idx      = max(nums) + 1 if nums else 0
         fname    = self.out_dir / f"{idx}.npz"
 
         np.savez_compressed(fname, **session)

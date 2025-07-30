@@ -46,6 +46,8 @@ git clone https://github.com/mnakash/spot-meta-teleop.git
 cd spot-meta-teleop
 
 # 3. Install requirements
+sudo apt update
+sudo apt install mpg123
 python -m pip install -r requirements.txt
 ```
 

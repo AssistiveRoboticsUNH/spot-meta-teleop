@@ -29,7 +29,7 @@ from bosdyn.client.frame_helpers import get_a_tform_b, VISION_FRAME_NAME
 
 from reader import OculusReader
 from demo_recorder import DemoRecorder
-from utils.spot_utils import mat_to_se3, reaxis, rot_to_quat, proto_to_cv2, image_to_cv
+from utils.spot_utils import mat_to_se3, reaxis
 from spot_images import SpotImages
 import logging, cv2
 
