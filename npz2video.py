@@ -6,7 +6,7 @@ from pathlib import Path
 def npz_to_video(npz_path: Path, video_path: Path, default_fps: float = 10.0):
     # --- Load session ---
     data = np.load(npz_path, allow_pickle=True)
-    images_obj = data["images"]   # object‐dtype array of ndarrays
+    images_obj = data["images_0"]   # object‐dtype array of ndarrays
 
     # --- Unpack to list of real uint8 arrays ---
     frames = []
