@@ -104,19 +104,20 @@ The dataset is organized in the following hierarchy:
 
 ```text
 arm_joint_names                (shape=(7,), dtype=|S8)
-demo_0/
-├── actions                    (shape=(N, 10), dtype=float32)
-└── obs/
-    ├── arm_dq                 (shape=(N, 7), dtype=float32)
-    ├── arm_q                  (shape=(N, 7), dtype=float32)
-    ├── body_vel               (shape=(N, 6), dtype=float32)
-    ├── ee_force               (shape=(N, 3), dtype=float32)
-    ├── eef_pos                (shape=(N, 3), dtype=float32)
-    ├── eef_quat               (shape=(N, 4), dtype=float32)
-    ├── gripper                (shape=(N, 1), dtype=float32)
-    ├── images_0               (shape=(N, 480, 640, 3), dtype=uint8)
-    ├── t                      (shape=(N, 1), dtype=float32)
-    └── vision_in_body         (shape=(N, 7), dtype=float32)
-demo_1/
+data/
+├── demo_0/
+|    ├── actions                    (shape=(N, 10), dtype=float32)
+|    └── obs/
+|        ├── arm_dq                 (shape=(N, 7), dtype=float32)
+|        ├── arm_q                  (shape=(N, 7), dtype=float32)
+|        ├── body_vel               (shape=(N, 6), dtype=float32)
+|        ├── ee_force               (shape=(N, 3), dtype=float32)
+|        ├── eef_pos                (shape=(N, 3), dtype=float32)
+|        ├── eef_quat               (shape=(N, 4), dtype=float32)
+|        ├── gripper                (shape=(N, 1), dtype=float32)
+|        ├── images_0               (shape=(N, 480, 640, 3), dtype=uint8)
+|        ├── t                      (shape=(N, 1), dtype=float32)
+|        └── vision_in_body         (shape=(N, 7), dtype=float32)
+├── demo_1/
 ...
-demo_N/
+├── demo_N/
