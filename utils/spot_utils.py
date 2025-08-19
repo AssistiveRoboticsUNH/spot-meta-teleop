@@ -1,43 +1,73 @@
 import numpy as np
-import math
+import cv2
+from typing import Dict, Optional, List
 from bosdyn.api import geometry_pb2
 from bosdyn.client.math_helpers  import SE3Pose, Quat
-import cv2
-from bosdyn.api import image_pb2
+from bosdyn.api import image_pb2, geometry_pb2
 
-def rot_to_quat(R: np.ndarray) -> Quat:
-    """Convert 3×3 rotation matrix to bosdyn Quat."""
-    t = np.trace(R)
-    if t > 0.0:
-        S = math.sqrt(t + 1.0) * 2.0
-        w = 0.25 * S
-        x = (R[2, 1] - R[1, 2]) / S
-        y = (R[0, 2] - R[2, 0]) / S
-        z = (R[1, 0] - R[0, 1]) / S
-    elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
-        S = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-        w = (R[2, 1] - R[1, 2]) / S
-        x = 0.25 * S
-        y = (R[0, 1] + R[1, 0]) / S
-        z = (R[0, 2] + R[2, 0]) / S
-    elif R[1, 1] > R[2, 2]:
-        S = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-        w = (R[0, 2] - R[2, 0]) / S
-        x = (R[0, 1] + R[1, 0]) / S
-        y = 0.25 * S
-        z = (R[1, 2] + R[2, 1]) / S
+def quat_to_matrix(q: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion (x,y,z,w) to rotation matrix (3,3).
+    (4,) -> (3,3).
+    """
+    x, y, z, w = q
+    tx, ty, tz = 2 * x, 2 * y, 2 * z
+    return np.array([
+        [1 - ty * y - tz * z, tx * y - tz * w,     tx * z + ty * w],
+        [tx * y + tz * w,     1 - tx * x - tz * z, ty * z - tx * w],
+        [tx * z - ty * w,     ty * z + tx * w,     1 - tx * x - ty * y]
+    ], dtype=np.float32)
+
+def matrix_to_quat(R: np.ndarray) -> np.ndarray:
+    """(3,3) -> (4,) (x,y,z,w)."""
+    m00, m01, m02 = R[0]
+    m10, m11, m12 = R[1]
+    m20, m21, m22 = R[2]
+    tr = m00 + m11 + m22
+
+    if tr > 0:
+        s = 0.5 / np.sqrt(tr + 1.0)
+        w = 0.25 / s
+        x = (m21 - m12) * s
+        y = (m02 - m20) * s
+        z = (m10 - m01) * s
+    elif m00 > m11 and m00 > m22:
+        s = 2.0 * np.sqrt(1.0 + m00 - m11 - m22)
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * np.sqrt(1.0 + m11 - m00 - m22)
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
     else:
-        S = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-        w = (R[1, 0] - R[0, 1]) / S
-        x = (R[0, 2] + R[2, 0]) / S
-        y = (R[1, 2] + R[2, 1]) / S
-        z = 0.25 * S
-    return Quat(w=w, x=x, y=y, z=z)
+        s = 2.0 * np.sqrt(1.0 + m22 - m00 - m11)
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    return np.array([x, y, z, w], dtype=np.float32)
+
+def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    """
+    6-D rep -> (3,3).
+    6-D representation is a rotation matrix is the first two columns of the rotation matrix.
+    """
+    a1, a2 = rot6d[:3], rot6d[3:]
+    b1 = a1 / np.linalg.norm(a1)
+    a2_proj = a2 - np.dot(b1, a2) * b1
+    b2 = a2_proj / np.linalg.norm(a2_proj)
+    b3 = np.cross(b1, b2)
+    return np.column_stack((b1, b2, b3)).astype(np.float32)
 
 def mat_to_se3(mat: np.ndarray) -> SE3Pose:
     """4x4 numpy SE(3) → bosdyn SE3Pose (SDK 5.x signature)."""
     pos  = mat[:3, 3]
-    quat = rot_to_quat(mat[:3, :3])
+    x, y, z, w = matrix_to_quat(mat[:3, :3])
+    quat = Quat(w=w, x=x, y=y, z=z)
     return SE3Pose(pos[0], pos[1], pos[2], quat)   # ← explicit tx, ty, tz , w, x, y, z
 
 
@@ -110,3 +140,15 @@ def image_to_cv(img_resp: image_pb2.ImageResponse) -> np.ndarray:
         return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     raise ValueError(f"Unhandled channel count ({chan}) or pixel_format {img.pixel_format}")
+
+
+def frame_pose(snapshot, child: str) -> Optional[geometry_pb2.SE3Pose]:
+    """Return Pose of *child* in its declared parent frame; None if missing."""
+    edge = snapshot.child_to_parent_edge_map.get(child)
+    return edge.parent_tform_child if edge else None
+
+def pose_to_vec(pose: geometry_pb2.SE3Pose) -> np.ndarray:
+    """SE3Pose -> 7-vector [tx,ty,tz,qx,qy,qz,qw]"""
+    t = pose.position
+    q = pose.rotation
+    return np.array([t.x, t.y, t.z, q.x, q.y, q.z, q.w], dtype=np.float32)

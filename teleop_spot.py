@@ -356,7 +356,7 @@ def main():
     print(f"Connecting to Spot at {robot_ip} ...")
     print(f"user: {user}, password: {password}")
 
-    meta_ip = "192.168.1.37"
+    meta_ip = "192.168.1.27"
     teleop = SpotVRTeleop(robot_ip, user, password, meta_quest_ip= meta_ip, demo_image_preview=False)
     teleop.run()
 
