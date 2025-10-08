@@ -18,7 +18,7 @@ Requires:
 Author: Moniruzzaman Akash
 """
 from __future__ import annotations
-import time, os, sys, signal
+import time, os, sys, signal, math
 from pathlib import Path
 import numpy as np
 
@@ -30,10 +30,13 @@ from bosdyn.client.robot_state    import RobotStateClient
 from bosdyn.client.estop   import EstopClient, EstopEndpoint, EstopKeepAlive
 from bosdyn.client.frame_helpers  import get_a_tform_b, VISION_FRAME_NAME, BODY_FRAME_NAME
 from bosdyn.client.docking           import DockingClient, blocking_dock_robot, blocking_undock, get_dock_id
-from bosdyn.api              import geometry_pb2
+from bosdyn.api              import geometry_pb2, arm_command_pb2, trajectory_pb2, robot_command_pb2, synchronized_command_pb2
+from google.protobuf import duration_pb2
+from bosdyn.client.math_helpers  import SE3Pose, Quat
 from bosdyn.client.gripper_camera_param import GripperCameraParamClient
 from bosdyn.client.image import ImageClient
 from spot_images import SpotImages
+from bosdyn.client.exceptions import InternalServerError
 from utils.spot_utils import quat_to_matrix, matrix_to_quat, rot6d_to_matrix, image_to_cv
 import logging, cv2
 
@@ -44,14 +47,14 @@ class SpotRobotController:
                  robot_ip: str,
                  username: str,
                  password: str,
-                 frame_name: str = BODY_FRAME_NAME,
-                 default_cmd_time: float = 0.2):
+                 arm_base_frame: str = BODY_FRAME_NAME,
+                 default_exec_time: float = 0.2):
         """
-        frame_name : reference frame for arm pose commands ("vision" works well).
+        frame_name : reference frame for arm pose commands.
         default_cmd_time : seconds over which Spot will execute each pose command.
         """
-        self.frame_name = frame_name
-        self.t_exec     = default_cmd_time
+        self.arm_base_frame = arm_base_frame
+        self.t_exec     = default_exec_time
 
         # --- connect & auth ------------------------------------------------
         sdk   = create_standard_sdk("spot-controller")
@@ -76,8 +79,8 @@ class SpotRobotController:
         self.estop_keepalive.allow()
 
         # --- clients -------------------------------------------------------
-        self._cmd  = self.robot.ensure_client("robot-command")
-        self._state= self.robot.ensure_client(RobotStateClient.default_service_name)
+        self.command_client  = self.robot.ensure_client("robot-command")
+        self.state_client= self.robot.ensure_client(RobotStateClient.default_service_name)
 
         # --- spot image -------------------------------------------------
         self.image_client = self.robot.ensure_client(ImageClient.default_service_name)
@@ -91,61 +94,150 @@ class SpotRobotController:
         )
 
         # power on if needed
-        if not self.robot.is_powered_on():
-            print("> Powering on Spot ...")
-            self.robot.power_on(timeout_sec=20)
+        try:
+            if not self.robot.is_powered_on():
+                print("> Powering on Spot ...")
+                self.robot.power_on(timeout_sec=20)
+            print("> Robot is powered on.")
+        except InternalServerError as e:
+            print(f"[!] Error powering on robot: {e}")
+            print("Reboot the robot and try again.")
+            sys.exit(1)
         
         self.dock_id = get_dock_id(self.robot)
 
         signal.signal(signal.SIGINT, self._clean_shutdown)
 
-    # ─── sensing ────────────────────────────────────────────────────────
-    def _current_pose(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (pos[3], quat[4]) of hand in self.frame_name."""
-        snap = self._state.get_robot_state().kinematic_state.transforms_snapshot
-        pose = get_a_tform_b(snap, self.frame_name, "hand")
-        pos  = np.array([pose.x, pose.y, pose.z], dtype=np.float32)
-        quat = np.array([pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w],
-                        dtype=np.float32)
-        return pos, quat
-
-    def _current_gripper(self) -> float:
-        man = self._state.get_robot_state().manipulator_state
-        return float(man.gripper_open_percentage)
 
     def _clean_shutdown(self, *_):
         print("\n[!] Shutting down VR teleop ...")
         try:
-            blocking_sit(self._cmd, timeout_sec=10)
+            self.stow_arm()
+            blocking_sit(self.command_client, timeout_sec=10)
         finally:
             self.estop_keepalive._end_periodic_check_in()
             self.estop_keepalive.stop()
             sys.exit(0)
 
     # ─── actuation helpers ───────────────────────────────────────────────
-    def _send_arm_pose(self, pos: np.ndarray, quat: np.ndarray):
+    def _send_arm_pose(self, pos: np.ndarray, quat: np.ndarray, frame_name= BODY_FRAME_NAME):
         """
-        pos : (3,) np.ndarray - metres in self.frame_name
+        pos : (3,) np.ndarray - metres in frame_name
         quat: (4,) np.ndarray - unit quaternion (x,y,z,w)
+        frame_name : reference frame for arm pose commands.
         """
-        pose_pb = geometry_pb2.SE3Pose(
-            position = geometry_pb2.Vec3(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])),
-            rotation = geometry_pb2.Quaternion(x=float(quat[0]), y=float(quat[1]),
-                                               z=float(quat[2]), w=float(quat[3])))
-        arm_cmd = RobotCommandBuilder.arm_pose_command_from_pose(
-            hand_pose = pose_pb,
-            frame_name= self.frame_name,
-            seconds   = self.t_exec)
-        self._cmd.robot_command(arm_cmd, end_time_secs = time.time() + self.t_exec)
+        try:
+            pose_pb = geometry_pb2.SE3Pose(
+                position = geometry_pb2.Vec3(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])),
+                rotation = geometry_pb2.Quaternion(x=float(quat[0]), y=float(quat[1]),
+                                                z=float(quat[2]), w=float(quat[3])))
+            arm_cmd = RobotCommandBuilder.arm_pose_command_from_pose(
+                hand_pose = pose_pb,
+                frame_name= frame_name,
+                seconds   = self.t_exec)
+            self.command_client.robot_command(arm_cmd, end_time_secs = time.time() + self.t_exec)
+        except Exception as e:
+            print(f"[!] Error sending arm pose command: {e}")
+    
+    def _make_pose_pb(self, pos_xyz: np.ndarray, quat_xyzw: np.ndarray) -> geometry_pb2.SE3Pose:
+        return geometry_pb2.SE3Pose(
+            position=geometry_pb2.Vec3(x=float(pos_xyz[0]), y=float(pos_xyz[1]), z=float(pos_xyz[2])),
+            rotation=geometry_pb2.Quaternion(x=float(quat_xyzw[0]), y=float(quat_xyzw[1]),
+                                            z=float(quat_xyzw[2]), w=float(quat_xyzw[3]))
+    )
 
-    def _send_gripper(self, opening: float):
+    # ─── public API ──────────────────────────────────────────────────────
+
+    # ─── sensing ───────────
+    def current_state(self):
+        """Return current robot state as a dictionary."""
+        state = self.state_client.get_robot_state()
+        return state
+        
+    def current_ee_pose(self, frame_name= BODY_FRAME_NAME) -> tuple[np.ndarray, np.ndarray]:
+        """Return (pos[3], quat[4]) of hand in frame_name."""
+        snap = self.current_state().kinematic_state.transforms_snapshot
+        pose = get_a_tform_b(snap, frame_name, "hand")
+        pos  = np.array([pose.x, pose.y, pose.z], dtype=np.float32)
+        quat = np.array([pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w],
+                        dtype=np.float32)
+        return pos, quat
+
+    def current_ee_pose_se3(self, frame_name= BODY_FRAME_NAME) -> SE3Pose:
+        """Return End-effector pose(SE3Pose) in frame_name."""    
+        snap = self.current_state().kinematic_state.transforms_snapshot
+        pose = get_a_tform_b(snap, frame_name, "hand")
+        return pose
+
+    def current_gripper(self) -> float:
+        man = self.current_state().manipulator_state
+        return float(man.gripper_open_percentage)
+
+    def get_hand_image(self) -> np.ndarray:
+        """
+        Get the image from the gripper camera.
+        Returns
+        -------
+        np.ndarray
+            The image from the gripper camera.
+        """
+
+        frame = image_to_cv(self.spot_images.get_hand_rgb_image())
+
+        return frame.copy()
+    
+    # ─── actuation ─────────
+    def send_gripper(self, opening: float):
         opening = opening / 100.0 if opening > 1.0 else opening # convert percentage to fraction if needed
         opening = float(np.clip(opening, 0.0, 1.0))
         grip_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(opening)
-        self._cmd.robot_command(grip_cmd)
+        self.command_client.robot_command(grip_cmd)
 
-    # ─── public API ──────────────────────────────────────────────────────
-    def apply_action(self, action: np.ndarray):
+    def move_arm_to(self,
+                  pos_xyz: np.ndarray,
+                  quat_xyzw: np.ndarray,
+                  gripper: None | float = None,
+                  verbose: bool = False,
+                  frame_name: str = BODY_FRAME_NAME):
+        """
+        Absolute command interface (no deltas).
+
+        Parameters
+        ----------
+        pos_xyz      : (3,) np.ndarray  - metres in frame_name
+        quat_xyzw    : (4,) np.ndarray  - unit quaternion
+        gripper      : float            - 0.0 closed … 1.0 open
+        frame_name   : str              - reference frame for arm pose commands.
+        """
+        if verbose:
+            print(f"Moving arm to: pos=({pos_xyz[0]:.2f}, {pos_xyz[1]:.2f}, {pos_xyz[2]:.2f}), "
+              f"quat=({quat_xyzw[0]:.2f}, {quat_xyzw[1]:.2f}, {quat_xyzw[2]:.2f}, {quat_xyzw[3]:.2f})")
+
+         # send arm pose
+        self._send_arm_pose(pos_xyz,
+                            quat_xyzw,
+                            frame_name)
+        if gripper is not None:
+            self.send_gripper(gripper)
+    
+    def move_base_with_velocity(self, vx: float, vy: float, wz: float):
+        """Send a velocity command to the robot base."""
+        try:
+            if self.dock_id is None: # If not docked, allow base movement
+                vel_cmd = RobotCommandBuilder.synchro_velocity_command(vx, vy, wz)
+                self.command_client.robot_command(vel_cmd, end_time_secs= time.time() + self.t_exec)
+        except Exception as e:
+            print(f"[!] Error sending velocity command: {e}")
+
+    def move_base_to(self, goal_x: float, goal_y: float, goal_heading: float, timeout, frame_name: str = VISION_FRAME_NAME):
+        """Send a position command to the robot base with respect to a given frame.(by default, vision frame)"""
+        try:
+            pos_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(goal_x, goal_y, goal_heading, frame_name)
+            self.command_client.robot_command(pos_cmd, end_time_secs= time.time() + float(timeout))
+        except Exception as e:
+            print(f"[!] Error sending position command: {e}")
+
+    def apply_action(self, action: np.ndarray, frame_name: str = BODY_FRAME_NAME):
         """
         Parameters
         ----------
@@ -155,7 +247,7 @@ class SpotRobotController:
         if action.shape != (10,):
             raise ValueError("Action must be np.ndarray with shape (10,)")
 
-        pos, quat = self._current_pose()
+        pos, quat = self.current_ee_pose()
 
         delta_p   = action[:3]
         rot6d     = action[3:9]
@@ -170,26 +262,8 @@ class SpotRobotController:
 
         # --- send to robot ---------------------------------------------
         print(f"Position({pos_cmd}), Quat({quat_cmd})")
-        self._send_arm_pose(pos_cmd, quat_cmd)
-        self._send_gripper(g_target)
-
-    def move_arm_to(self,
-                  pos_xyz: np.ndarray,
-                  quat_xyzw: np.ndarray,
-                  gripper: float):
-        """
-        Absolute command interface (no deltas).
-
-        Parameters
-        ----------
-        pos_xyz      : (3,) np.ndarray  - metres in self.frame_name
-        quat_xyzw    : (4,) np.ndarray  - unit quaternion
-        gripper      : float            - 0.0 closed … 1.0 open
-        """
-        self._send_arm_pose(pos_xyz.astype(np.float32),
-                            quat_xyzw.astype(np.float32))
-        self._send_gripper(gripper)
-
+        self.move_arm_to(pos_cmd, quat_cmd, g_target, frame_name)
+        
     def undock(self):
         try:
             self.dock_id = get_dock_id(self.robot)
@@ -209,12 +283,16 @@ class SpotRobotController:
         try:
             self.dock_id = get_dock_id(self.robot)
             if self.dock_id is None:
+                self.send_gripper(0.0)  # Close gripper before docking
                 print("Robot is undocked → docking ...")
                 # Stand before trying to dock.
-                blocking_stand(self._cmd, timeout_sec=10)
+                blocking_stand(self.command_client, timeout_sec=10)
                 blocking_dock_robot(self.robot, dock_id=520, timeout=30)
                 self.dock_id = get_dock_id(self.robot)
                 print(f"Robot docked at id={self.dock_id} and powered off.")
+                print("> Powering on again...")
+                self.robot.power_on(timeout_sec=20)
+                print("> Robot is powered on.")
                 return True
             else:
                 print(f"Robot is already docked at {self.dock_id}.")
@@ -222,27 +300,24 @@ class SpotRobotController:
         except Exception as e:
             print(f"[!] Error during docking: {e}")
             return False
-        
-    def get_hand_image(self) -> np.ndarray:
-        """
-        Get the image from the gripper camera.
-        Returns
-        -------
-        np.ndarray
-            The image from the gripper camera.
-        """
-
-        frame = image_to_cv(self.spot_images.get_hand_rgb_image())
-
-        return frame.copy()
+    
+    def dock_undock(self):
+        try:
+            self.dock_id = get_dock_id(self.robot)
+            if self.dock_id is not None:
+                self.undock()
+            else:
+                self.dock()
+        except Exception as e:
+            print(f"[!] Error during docking/undocking: {e}")
     
     def stow_arm(self):
         """Stow the arm to a safe position."""
         print("Stowing arm...")
         try:
             stow_cmd = RobotCommandBuilder.arm_stow_command()
-            cmd_id = self._cmd.robot_command(stow_cmd, end_time_secs=time.time() + 5.0)
-            block_until_arm_arrives(self._cmd, cmd_id)
+            cmd_id = self.command_client.robot_command(stow_cmd, end_time_secs=time.time() + 5.0)
+            block_until_arm_arrives(self.command_client, cmd_id)
             self.stowed = True
             print("Arm stowed.")
         except Exception as e:
@@ -253,10 +328,102 @@ class SpotRobotController:
         print("Unstowing arm...")
         try:
             unstow_cmd = RobotCommandBuilder.arm_ready_command()
-            cmd_id = self._cmd.robot_command(unstow_cmd, end_time_secs=time.time() + 5.0)
-            block_until_arm_arrives(self._cmd, cmd_id)
+            cmd_id = self.command_client.robot_command(unstow_cmd, end_time_secs=time.time() + 5.0)
+            block_until_arm_arrives(self.command_client, cmd_id)
             self.stowed = False
             print("Arm unstowed.")
         except Exception as e:
             print(f"[!] Error unstowing arm: {e}")
+    
+    def stand(self):
+        """Stand the robot up."""
+        print("Standing up...")
+
+        # Checking if the robot is powered on
+        if not self.robot.is_powered_on():
+            print("> Please power on the robot first.")
+            return
+        try:
+            blocking_stand(self.command_client, timeout_sec=10)
+        except Exception as e:
+            print(f"[!] Error standing up: {e}")
+
+    def sit(self):
+        """Sit the robot down."""
+        print("Sitting down...")
+
+        # Checking if the robot is powered on
+        if not self.robot.is_powered_on():
+            print("> Please power on the robot first.")
+            return
+        try:
+            blocking_sit(self.command_client, timeout_sec=10)
+        except Exception as e:
+            print(f"[!] Error sitting down: {e}")
+
+    def _duration_from_seconds(self, sec: float) -> duration_pb2.Duration:
+        """Convert float seconds to protobuf Duration (seconds + nanos)."""
+        sec = max(0.0, float(sec))
+        whole = int(math.floor(sec))
+        nanos = int(round((sec - whole) * 1e9))
+        if nanos >= 1_000_000_000:  # handle rounding edge cases
+            whole += 1
+            nanos = 0
+        d = duration_pb2.Duration()
+        d.seconds = whole
+        d.nanos = nanos
+        return d
+    def send_arm_cartesian_hybrid(
+        self,
+        pos_xyz, quat_xyzw,
+        *,
+        seconds: float = 0.25,
+        max_lin_vel: float = 0.25,
+        max_ang_vel: float = 0.8,
+        max_accel: float = 2.0,
+        root_frame: str = "body",
+        task_T_root: geometry_pb2.SE3Pose | None = None,
+        desired_wrench_in_task: tuple[float, float, float, float, float, float] | None = None
+    ):
+        # Build ArmCartesianCommand
+        cart_req = arm_command_pb2.ArmCartesianCommand.Request()
+        cart_req.root_frame_name = root_frame
+        if task_T_root is not None:
+            cart_req.root_tform_task.CopyFrom(task_T_root)
+
+        pose_pb = geometry_pb2.SE3Pose(
+            position=geometry_pb2.Vec3(x=float(pos_xyz[0]), y=float(pos_xyz[1]), z=float(pos_xyz[2])),
+            rotation=geometry_pb2.Quaternion(x=float(quat_xyzw[0]), y=float(quat_xyzw[1]),
+                                            z=float(quat_xyzw[2]), w=float(quat_xyzw[3]))
+        )
+
+        pose_pt = trajectory_pb2.SE3TrajectoryPoint(
+            pose=pose_pb,
+            time_since_reference=self._duration_from_seconds(seconds)
+        )
+        cart_req.pose_trajectory_in_task.points.append(pose_pt)
+
+        if desired_wrench_in_task is not None:
+            Fx, Fy, Fz, Tx, Ty, Tz = desired_wrench_in_task
+            wrench_pt = arm_command_pb2.WrenchTrajectoryPoint(
+                wrench=geometry_pb2.Wrench(
+                    force=geometry_pb2.Vec3(x=float(Fx), y=float(Fy), z=float(Fz)),
+                    torque=geometry_pb2.Vec3(x=float(Tx), y=float(Ty), z=float(Tz)),
+                ),
+                time_since_reference=self._duration_from_seconds(seconds)
+            )
+            cart_req.wrench_trajectory_in_task.points.append(wrench_pt)
+
+        cart_req.max_linear_velocity.value  = float(max_lin_vel)
+        cart_req.max_angular_velocity.value = float(max_ang_vel)
+        cart_req.maximum_acceleration.value = float(max_accel)
+
+        arm_req  = arm_command_pb2.ArmCommand.Request(arm_cartesian_command=cart_req)
+        sync_req = synchronized_command_pb2.SynchronizedCommand.Request(arm_command=arm_req)
+        cmd = robot_command_pb2.RobotCommand(synchronized_command=sync_req)
+
+        return self.command_client.robot_command(cmd, end_time_secs=time.time() + seconds)
+
+
+
 
