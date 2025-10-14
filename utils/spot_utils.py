@@ -71,36 +71,42 @@ def mat_to_se3(mat: np.ndarray) -> SE3Pose:
     return SE3Pose(pos[0], pos[1], pos[2], quat)   # ← explicit tx, ty, tz , w, x, y, z
 
 
-def reaxis(mat4: np.ndarray) -> np.ndarray:
+def get_trasnformation_mat(x,y,z, tx=0, ty=0, tz=0) -> np.ndarray:
     """
-    Rotate pose from controller frame to robot-hand frame.
+    Get transformation matrix from eular angles and translation in 'xyz'(intrinsic) convention.
+    Angles are in degrees.
+    """
+    cx, cy, cz = np.cos(np.radians([x,y,z]))
+    sx, sy, sz = np.sin(np.radians([x,y,z]))
+
+    R = np.array([
+        [cy*cz, -cy*sz, sy],
+        [sx*sy*cz + cx*sz, -sx*sy*sz + cx*cz, -sx*cy],
+        [-cx*sy*cz + sx*sz, cx*sy*sz + sx*cz, cx*cy]
+    ], dtype=np.float32)
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = R
+    T[0, 3] = tx
+    T[1, 3] = ty
+    T[2, 3] = tz
+    return T
+
+def map_controller_to_robot(delta_controller: np.ndarray) -> np.ndarray:
+    """
+    Convert delta pose from controller frame to robot frame.
+    delta_controller: 4x4 numpy array
+    return: delta_robot: 4x4 numpy array
 
     Controller-frame  →  Desired-hand-frame
-    new x  (forward)  = −old y
-    new y  (left)     = −old x
+    new x  (forward)  = -old y
+    new y  (left)     = -old x
     new z  (up)       = -old z
-
-    in 'xyz' convention, x=-180, y=0, z=90
-    which is 
-    R_CONV = np.array([
-        [ 0, -1,  0],
-        [-1,  0,  0],
-        [ 0,  0, -1]])
-
-    But we calculate for x=-150, y=0, z=90(arm frame is slightly rotated along x-axis)
     """
-    # right-handed, det = +1    
-    R_CONV = np.array([
-        [ 0, -1,  0],
-        [-0.8660254, -0.0000000,  0.5000000],
-        [ -0.5000000, -0.0000000, -0.8660254]])
+    cTr = get_trasnformation_mat(-150, 0, 90)  # controller to robot
 
-    m = mat4.copy()
-    # rotate orientation
-    m[:3, :3] = mat4[:3, :3] @ R_CONV
-    # no need to rotate position, since it is in the same frame as orientation
-    
-    return m
+    delta_robot = cTr @ delta_controller @ np.linalg.inv(cTr)
+    return delta_robot
+
 
 def proto_to_cv2(img_resp):
     """Convert a Spot ImageResponse with PIXEL_FORMAT_RGB_U8 to an OpenCV BGR image."""

@@ -10,77 +10,30 @@ The script assumes you already have:
 
 Author: Moniruzzaman Akash
 """
-import argparse, math, signal, sys, time, threading, os
+import argparse, math, signal, sys, time, os
 import numpy as np
 from typing import Tuple, Dict
 
-from bosdyn.api import geometry_pb2
-from bosdyn.client import create_standard_sdk, robot_command
-from bosdyn.client.estop   import EstopClient, EstopEndpoint, EstopKeepAlive
-from bosdyn.client.lease   import LeaseClient, LeaseKeepAlive, ResourceAlreadyClaimedError
-from bosdyn.client.power   import PowerClient
-from bosdyn.client.docking import DockingClient, blocking_undock, blocking_dock_robot, get_dock_id
-from bosdyn.client.robot_command import RobotCommandBuilder, blocking_stand, blocking_sit, block_until_arm_arrives
-from bosdyn.client.gripper_camera_param import GripperCameraParamClient
-from bosdyn.client.image import ImageClient
-from bosdyn.client.robot_state   import RobotStateClient
-from bosdyn.client.math_helpers  import SE3Pose, Quat
-from bosdyn.client.frame_helpers import get_a_tform_b, VISION_FRAME_NAME
+from bosdyn.client.frame_helpers import get_a_tform_b, VISION_FRAME_NAME, BODY_FRAME_NAME
+from spot_controller import SpotRobotController
 
-from reader import OculusReader
+from reader import OculusReader, get_connecteed_device_ip
 from demo_recorder import DemoRecorder
-from utils.spot_utils import mat_to_se3, reaxis
-from spot_images import SpotImages
-import logging, cv2
-
+from utils.spot_utils import mat_to_se3, map_controller_to_robot
+import logging
 
 class SpotVRTeleop:
     MAX_VEL_X = 0.6          # [m/s] forward/back
     MAX_VEL_Y = 0.6          # [m/s] left/right
     MAX_YAW   = 0.8          # [rad/s] spin
     ARM_SCALE = 2.0          # [m per m] controller-to-arm translation
-    VELOCITY_CMD_DURATION = 0.2  # seconds
+
+    VEL_SMOOTH_ALPHA = 0.35  # simple first-order smoothing for base
 
     def __init__(self, robot_ip, username, password, meta_quest_ip=None, demo_image_preview=True):
         self.oculus_reader = OculusReader(ip_address=meta_quest_ip)
-
-        sdk = create_standard_sdk("spot-teleop")
-        self.robot = sdk.create_robot(robot_ip)
-        self.robot.authenticate(username, password)
-        self.robot.time_sync.wait_for_sync()
-
-        # ── LEASE ─────────────────────────────────────────
-        self.lease_client = self.robot.ensure_client(LeaseClient.default_service_name)
-        try:
-            self.lease = self.lease_client.acquire()
-        except ResourceAlreadyClaimedError:
-            self.lease = self.lease_client.take()
-        self.robot.lease_wallet.add(self.lease)
-        self.lease_keepalive = LeaseKeepAlive(self.lease_client)
-
-        # ── E-STOP (simple) ───────────────────────────────
-        estop_client = self.robot.ensure_client("estop")
-        self.estop_endpoint = EstopEndpoint(estop_client, "vr_teleop", 9.0)
-        self.estop_endpoint.force_simple_setup()
-        self.estop_keepalive = EstopKeepAlive(self.estop_endpoint)
-        self.estop_keepalive.allow()
-
-
-        # command/state clients
-        self.command_client   = self.robot.ensure_client("robot-command")
-        self.state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
-
-
-        self.image_client = self.robot.ensure_client(ImageClient.default_service_name)
-        self.gripper_cam_param_client = self.robot.ensure_client(GripperCameraParamClient.default_service_name)
-        self.logger = logging.getLogger()
-        self.spot_images = SpotImages(
-            self.robot,
-            self.logger,
-            self.image_client,
-            self.gripper_cam_param_client
-        )
-
+        self.spot = SpotRobotController(robot_ip, username, password)
+        self.logger = logging.getLogger("vr-teleop")
 
         # ---- runtime vars ---
         self.arm_anchor_ctrl  = None   # 4×4 SE(3) when grip first pressed
@@ -88,24 +41,18 @@ class SpotVRTeleop:
         self.prev_r_grip      = False
         self.base_enabled     = False
 
+        # Base smoothing state
+        self._vx_f = 0.0
+        self._vy_f = 0.0
+        self._wz_f = 0.0
+
         self.stowed = False  # arm stowed at start
         self.demo_image_preview = demo_image_preview  # show camera preview in demo mode1
 
-        signal.signal(signal.SIGINT, self._clean_shutdown)
-
-
-        # ── POWER ON ───────────────────────────────
-        if not self.robot.is_powered_on():
-            print("> Powering on...")
-            self.robot.power_on(timeout_sec=20)
-        print("> Robot is powered on.")
-
-        self.dock_id = get_dock_id(self.robot)
-
         self.recorder = DemoRecorder(
-            robot=self.robot,
-            spot_images=self.spot_images,
-            state_client=self.state_client,
+            robot=self.spot.robot,
+            spot_images=self.spot.spot_images,
+            state_client=self.spot.state_client,
             out_dir="demos",
             fps=10,
             preview=self.demo_image_preview)
@@ -113,140 +60,25 @@ class SpotVRTeleop:
     def get_meta_quest(self):
         return self.oculus_reader.get_transformations_and_buttons()
 
-    def undock(self):
-        try:
-            self.dock_id = get_dock_id(self.robot)
-            if self.dock_id is not None:
-                print(f"Robot is docked at {self.dock_id} → undocking …")
-                blocking_undock(self.robot, timeout=20)
-                self.dock_id = get_dock_id(self.robot)
-                print("Robot undocked.")
-                return True
-            else:
-                print("Robot is not docked.")
-                return False
-        except Exception as e:
-            print(f"[!] Error during undocking: {e}")
-            return False
-    def dock(self):
-        try:
-            self.dock_id = get_dock_id(self.robot)
-            if self.dock_id is None:
-                print("Robot is undocked → docking ...")
-                # Stand before trying to dock.
-                blocking_stand(self.command_client, timeout_sec=10)
-                blocking_dock_robot(self.robot, dock_id=520, timeout=30)
-                self.dock_id = get_dock_id(self.robot)
-                print(f"Robot docked at id={self.dock_id} and powered off.")
-                return True
-            else:
-                print(f"Robot is already docked at {self.dock_id}.")
-                return False
-        except Exception as e:
-            print(f"[!] Error during docking: {e}")
-            return False
+    def toggle_recording(self):
+        self.recorder.start() if not self.recorder.is_recording else self.recorder.stop()
 
-    def dock_undock(self):
-        try:
-            self.dock_id = get_dock_id(self.robot)
-            if self.dock_id is not None:
-                print(f"Robot is docked at {self.dock_id} → undocking …")
-                blocking_undock(self.robot, timeout=20)
-                self.dock_id = get_dock_id(self.robot)
-                print("Robot undocked.")
-            else:
-                print("Robot is undocked → docking ...")
-                # Stand before trying to dock.
-                blocking_stand(self.command_client, timeout_sec=10)
-                blocking_dock_robot(self.robot, dock_id=520, timeout=30)
-                self.dock_id = get_dock_id(self.robot)
-                print(f"Robot docked at id={self.dock_id} and powered off.")
-                print("> Powering on again...")
-                self.robot.power_on(timeout_sec=20)
-                print("> Robot is powered on.")
-        except Exception as e:
-            print(f"[!] Error during docking/undocking: {e}")
-        
-    def stand(self):
-        # self.robot.power_on(timeout_sec=20.0)
-        blocking_stand(self.command_client, timeout_sec=10)
-
-    def sit(self):
-        blocking_sit(self.command_client, timeout_sec=10)
-
-    def move(self, vx: float, vy: float, wz: float):
-        """Send a velocity command to the robot base."""
-        try:
-            vel_cmd = RobotCommandBuilder.synchro_velocity_command(vx, vy, wz)
-            self.command_client.robot_command(vel_cmd, end_time_secs=time.time() + self.VELOCITY_CMD_DURATION)
-        except Exception as e:
-            print(f"[!] Error sending velocity command: {e}")
-
-    def move_arm_to(self, pose):
-        """Move the arm to a specified pose in vision frame."""
-        # print goal pose
-        print(f"Moving arm to: {pose.x:.2f}, {pose.y:.2f}, {pose.z:.2f}")
-
-        try:
-            # Convert SE3Pose to protobuf SE3Pose
-            pose_pb = geometry_pb2.SE3Pose(
-                position=geometry_pb2.Vec3(x=pose.x, y=pose.y, z=pose.z),
-                rotation=geometry_pb2.Quaternion(w=pose.rot.w, x=pose.rot.x,
-                                                 y=pose.rot.y, z=pose.rot.z)
-            )
-            arm_cmd = RobotCommandBuilder.arm_pose_command_from_pose(
-                hand_pose=pose_pb,
-                frame_name=VISION_FRAME_NAME,
-                seconds=self.VELOCITY_CMD_DURATION
-            )
-            self.command_client.robot_command(arm_cmd, end_time_secs=time.time() + self.VELOCITY_CMD_DURATION)
-        except Exception as e:
-            print(f"[!] Error sending arm command: {e}")
-
-    def stow_arm(self):
-        """Stow the arm to a safe position."""
-        print("Stowing arm...")
-        try:
-            stow_cmd = RobotCommandBuilder.arm_stow_command()
-            cmd_id = self.command_client.robot_command(stow_cmd, end_time_secs=time.time() + 5.0)
-            block_until_arm_arrives(self.command_client, cmd_id)
-            self.stowed = True
-            print("Arm stowed.")
-        except Exception as e:
-            print(f"[!] Error stowing arm: {e}")
-
-    def unstow_arm(self):
-        """Unstow the arm to a ready position."""
-        print("Unstowing arm...")
-        try:
-            unstow_cmd = RobotCommandBuilder.arm_ready_command()
-            cmd_id = self.command_client.robot_command(unstow_cmd, end_time_secs=time.time() + 5.0)
-            block_until_arm_arrives(self.command_client, cmd_id)
-            self.stowed = False
-            print("Arm unstowed.")
-        except Exception as e:
-            print(f"[!] Error unstowing arm: {e}")
-
+    def _smooth(self, prev: float, target: float, alpha: float) -> float:
+        """1st order filter."""
+        return (1 - alpha) * prev + alpha * target
+    
     def run(self):
         rate_hz = 30.0
         dt = 1.0 / rate_hz
         t_prev = time.time()
         
+        # --- per-axis limits (N): start scaling at soft, stop by hard ---
+        soft_limits = np.array([5.0, 5.0, 5.0], dtype=float)   # Fx, Fy, Fz
+        hard_limits = np.array([8.0, 8.0, 8.0], dtype=float)
+        self.prev_goal_xyz = None
+
+        t = 0
         while True:
-            # --- Camera preview (runs every loop; throttle if needed) -------------
-            # try:
-            #     img_resp = self.spot_images.get_rgb_image("hand_color_image")   # pick any getter you like
-            #     if img_resp is not None:
-            #         frame = image_to_cv(img_resp)
-            #         cv2.imshow("Hand", frame)
-            #         cv2.waitKey(1)      # keeps the window responsive
-            # except Exception as e:
-            #     print(f"[!] Could not display image: {e}")
-
-            # state = self.state_client.get_robot_state()  # keep state fresh
-            # print(f"Robot state: {state}")
-
-
             poses, buttons = self.get_meta_quest()
 
             if len(poses) == 0 or len(buttons) == 0:
@@ -256,12 +88,23 @@ class SpotVRTeleop:
 
             # ---------------- POWER TOGGLE (A/B) ------------------
             if buttons.get('A', False):
-                # self.stand()
-                self.dock_undock()
+                self.spot.dock_undock()
             if buttons.get('B', False):
-                # self.sit()
-                # self._clean_shutdown()
-                self.recorder.start() if not self.recorder.is_recording else self.recorder.stop()
+                self.toggle_recording()
+            # ------------------ STOW/UNSTOW ARM -------------------
+            if buttons.get('X', False):
+                self.spot.stow_arm()
+            if buttons.get('Y', False):
+                # self.spot.unstow_arm()
+                # Move arm to a ready position
+                self.spot.send_arm_cartesian_hybrid(
+                    pos_xyz=np.array([0.9, 0, 0.2]),
+                    quat_xyzw=np.array([0, 0.7071068, 0, 0.7071068]),
+                    seconds=2.0,
+                    max_lin_vel=0.25,
+                    max_ang_vel=0.8,
+                    root_frame="body",  # or "vision"
+                )
 
             # ---------------- BASE  (LEFT HAND) -------------------
             lgrip  = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
@@ -272,25 +115,33 @@ class SpotVRTeleop:
                 vx  =  self.MAX_VEL_X * (ljy)        # up on joystick = +y in Quest
                 vy  =  self.MAX_VEL_Y * (-ljx)         # right on joystick = +x in Quest
                 wz  =  self.MAX_YAW   * (-rjx)         # right on JS -> negative yaw
-                if self.dock_id is None: # If not docked, allow base movement
-                    self.move(vx, vy, wz)
+
+                # FIX: smooth velocities to reduce jerk
+                self._vx_f = self._smooth(self._vx_f, vx, self.VEL_SMOOTH_ALPHA)
+                self._vy_f = self._smooth(self._vy_f, vy, self.VEL_SMOOTH_ALPHA)
+                self._wz_f = self._smooth(self._wz_f, wz, self.VEL_SMOOTH_ALPHA)
+
+                self.spot.move_base_with_velocity(vx, vy, wz)
 
             except Exception as e:
                 print(f"[!] Error sending base command: {e}")
 
+            # ---------------- GRIPPER TRIGGER ----------------------
+            trigger_val = 1- buttons.get('rightTrig', (0.0,))[0] # use reverse of right trigger
+            self.spot.send_gripper(trigger_val)
+
             # ---------------- ARM   (RIGHT HAND) -------------------
             try:
                 lgrip = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
-                # rTrig = buttons.get('rightTrig', (0.0,))[0]
                 rmat_raw  = poses['r']
                 # Meta Quest arm frame has z-down, x-right coordinate system.
                 # Reaxis to convert to robot hand frame: x-forward, y-left, z-up
-                rmat = reaxis(rmat_raw)
+                rmat = map_controller_to_robot(rmat_raw)
 
                 if lgrip and not self.prev_r_grip:
                     # first frame with grip pressed -> anchor
                     self.arm_anchor_ctrl  = rmat.copy()
-                    self.arm_anchor_robot = self._current_ee_pose()
+                    self.arm_anchor_robot = self.spot.current_ee_pose_se3()
                 if lgrip:
                     self.stowed = False  # arm is unstowed when moving arm
                     # Cartesian delta = anchor^{-1} * current
@@ -304,22 +155,111 @@ class SpotVRTeleop:
                     # Compose with robot-space anchor to get absolute target
                     goal = self.arm_anchor_robot * delta_pose  # composition
 
-                    self.move_arm_to(goal)
+
+                    # ---- force-aware delta limiting (project onto contact normal) ----
+                    PARALLEL_MIN_SCALE = 0.0   # residual motion allowed along normal at/above hard (0..1)
+                    F_DETECT = 0.8              # N; ignore tiny forces to avoid flicker
+                    ALPHA_F = 0.2               # force EWMA smoothing factor
+
+                    # absolute target (BODY) from your anchor + controller
+                    desired_xyz = np.array([goal.x, goal.y, goal.z], dtype=float)
+
+                    # operate on DELTA (not absolute goal)
+                    pose_now = self.spot.current_ee_pose_se3()
+                    x_now = np.array([pose_now.x, pose_now.y, pose_now.z], dtype=float)
+
+                    # per-tick commanded delta in BODY
+                    delta_cmd = desired_xyz - x_now
+
+                    if np.linalg.norm(delta_cmd) < 1e-9:
+                        blended_xyz = desired_xyz
+                    else:
+                        # --- force in BODY frame ---
+                        man = self.spot.state_client.get_robot_state().manipulator_state
+                        fH = man.estimated_end_effector_force_in_hand
+                        f_hand = np.array([fH.x, fH.y, fH.z], dtype=float)
+
+                        # BODY <- HAND rotation from CURRENT EE pose (not goal)
+                        pose = self.spot.current_ee_pose_se3()
+                        try:
+                            R_BH = pose.rot.to_matrix()  # preferred API
+                        except AttributeError:
+                            # fallback: build from quaternion
+                            qx, qy, qz, qw = pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w
+                            R_BH = np.array([
+                                [1-2*(qy*qy+qz*qz),   2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+                                [2*(qx*qy + qz*qw), 1-2*(qx*qx+qz*qz),   2*(qy*qz - qx*qw)],
+                                [2*(qx*qz - qy*qw),   2*(qy*qz + qx*qw), 1-2*(qx*qx+qy*qy)],
+                            ], dtype=float)
+
+                        F_body = R_BH @ f_hand
+
+                        # smooth force a bit to avoid chatter
+                        self._Ff = (1.0 - ALPHA_F) * getattr(self, "_Ff", np.zeros(3)) + ALPHA_F * F_body
+                        F_body = self._Ff
+                        normF = float(np.linalg.norm(F_body))
+
+                        # default: pass-through
+                        delta_out = delta_cmd
+
+                        if normF > F_DETECT:
+                            # contact normal to LIMIT ALONG = INTO the surface = -unit(force)
+                            n_c = -F_body / (normF + 1e-9)
+
+                            # decompose commanded delta w.r.t. contact normal
+                            d_par_mag = float(np.dot(delta_cmd, n_c))  # >0 = moving INTO contact
+                            d_par  = d_par_mag * n_c
+                            d_ortho = delta_cmd - d_par
+
+                            # print("d_par_mag:", d_par_mag, "N:", n_c, "F:", np.round(F_body,2), f"||F||={normF:.1f}N")
+
+                            if d_par_mag > 0.0:
+                                # effective thresholds along n_c (tightest axis wins)
+                                abs_nc = np.abs(n_c) + 1e-9
+                                soft_eff = float(np.min(soft_limits / abs_nc))
+                                hard_eff = float(np.min(hard_limits / abs_nc))
+
+                                # scale α(F): 1 → PARALLEL_MIN_SCALE as force rises from soft→hard
+                                if normF <= soft_eff:
+                                    alpha = 1.0
+                                elif normF >= hard_eff:
+                                    alpha = PARALLEL_MIN_SCALE
+                                else:
+                                    k = (normF - soft_eff) / (hard_eff - soft_eff + 1e-9)
+                                    alpha = (1.0 - k) * (1.0 - PARALLEL_MIN_SCALE) + PARALLEL_MIN_SCALE
+
+                                delta_out = d_ortho + alpha * d_par
+                            else:
+                                delta_out = delta_cmd  # moving away or tangential → don’t restrict
+
+                        # convert back to absolute target to send
+                        blended_xyz = x_now + delta_out
+                        
+                        # if not hasattr(self, "_dbg_t"): self._dbg_t = 0.0
+                        # try:
+                        #     if time.time() - getattr(self, "_dbg_t", 0) > 0.25:
+                        #         self._dbg_t = time.time()
+                        #         print(f"‖F‖={normF:5.2f}  soft_eff={soft_eff:4.2f} hard_eff={hard_eff:4.2f}  "
+                        #             f"d_par={d_par_mag:6.3f}  alpha={alpha:4.2f}  "
+                        #             f"F_body={F_body.round(2)}  n={n_c.round(3)}")
+                        # except Exception:
+                        #     pass
+
+                    self.spot.send_arm_cartesian_hybrid(
+                        pos_xyz=np.array(blended_xyz),
+                        quat_xyzw=np.array([goal.rot.x, goal.rot.y, goal.rot.z, goal.rot.w]),
+                        seconds=0.25,
+                        max_lin_vel=0.30,
+                        max_ang_vel=1.5,
+                        root_frame="body",  # or "vision"
+                    )
+                    # update previous AFTER sending
+                    self.prev_goal_xyz = blended_xyz.copy()
+                
 
                 self.prev_r_grip = lgrip
             except Exception as e:
                 print(f"[!] Error sending arm command: {e}")
-
-            # ------------------ STOW/UNSTOW ARM -------------------
-            if buttons.get('X', False):
-                self.stow_arm()
-            if buttons.get('Y', False):
-                self.unstow_arm()
-
-            # ---------------- GRIPPER TRIGGER ----------------------
-            trigger_val = 1- buttons.get('rightTrig', (0.0,))[0] # use reverse of left trigger
-            grip_cmd = RobotCommandBuilder.claw_gripper_open_fraction_command(trigger_val)
-            self.command_client.robot_command(grip_cmd)
 
             # ------------- keep teleop RT responsive --------------
             sleep = max(0.0, dt - (time.time() - t_prev))
@@ -329,34 +269,21 @@ class SpotVRTeleop:
             if self.demo_image_preview:
                 self.recorder.poll_preview()
 
-    # ---------------------------------------------------------------------#
-    #      HELPERS                                                         #
-    # ---------------------------------------------------------------------#
-    def _current_ee_pose(self) -> SE3Pose:
-        """End-effector pose in vision frame."""
-        state = self.state_client.get_robot_state()
-        return get_a_tform_b(state.kinematic_state.transforms_snapshot,
-                             VISION_FRAME_NAME, "hand")
-
-    def _clean_shutdown(self, *_):
-        print("\n[!] Shutting down VR teleop ...")
-        try:
-            self.sit()
-            # self.oculus_reader.stop()
-        finally:
-            self.estop_keepalive._end_periodic_check_in()
-            self.estop_keepalive.stop()
-            sys.exit(0)
 
 def main():
     robot_ip = os.environ.get("SPOT_ROBOT_IP", "192.168.1.138")
     user     = os.environ.get("BOSDYN_CLIENT_USERNAME", "user")
     password = os.environ.get("BOSDYN_CLIENT_PASSWORD", "password")
 
+    meta_ip = get_connecteed_device_ip()
+    if meta_ip is None:
+        print("[!] Could not find connected Meta Quest device IP via ADB.")
+        print("    Please ensure ADB is set up and allowed access.")
+        return
+    
     print(f"Connecting to Spot at {robot_ip} ...")
-    print(f"user: {user}, password: {password}")
+    print(f"user: {user}, password: {len(password) * '*'}")
 
-    meta_ip = "192.168.1.27"
     teleop = SpotVRTeleop(robot_ip, user, password, meta_quest_ip= meta_ip, demo_image_preview=False)
     teleop.run()
 

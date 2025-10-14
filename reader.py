@@ -8,7 +8,7 @@ Optimized by: Moniruzzaman Akash
 import numpy as np
 import threading
 import time
-import os
+import os, subprocess
 from ppadb.client import Client as AdbClient
 import sys
 
@@ -283,9 +283,26 @@ class OculusReader:
                 eprint("ADB ping error:", e)
             time.sleep(20)  # every 20 seconds
 
+def get_connecteed_device_ip():
+    try:
+        result = subprocess.run(['adb', 'shell', 'ip', 'route'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        lines = result.stdout.strip().split('\n')
+        for line in lines:  # Skip the first line which is a header
+            if 'src' in line:
+                ip = line.split()[-1]
+                if ip.count('.') == 3:  # Simple check for IP address format
+                    return ip
+        print("Has no access! Please connect the device via USB and allow access.")
+        return None
+    except Exception as e:
+        eprint("Error getting connected device IP:", e)
+        return None
+
 def main():
     # Optional: Set your device IP if using wireless ADB
-    IP_ADDRESS = None # Use meta quest IP e.g "192.168.1.54" if you want to control over wifi.
+    # IP_ADDRESS = None # Use meta quest IP e.g "192.168.1.54" if you want to control over wifi.
+    IP_ADDRESS = get_connecteed_device_ip() # Use None if connected over USB
+
     oculus_reader = OculusReader(ip_address=IP_ADDRESS)
 
     try:
