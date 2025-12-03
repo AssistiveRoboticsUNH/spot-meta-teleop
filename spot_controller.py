@@ -361,6 +361,28 @@ class SpotRobotController:
         except Exception as e:
             print(f"[!] Error sitting down: {e}")
 
+    def reset_pose(self, pose=[0.9, 0, 0.2, 0, 0.7071068, 0, 0.7071068], frane_name= BODY_FRAME_NAME):
+        """Move the arm to a default pose.
+        Parameters
+        ----------
+        pose : list of float, shape (7,)
+            [x, y, z, qx, qy, qz, qw]
+        """
+        # parameter validation
+        if len(pose) != 7:
+            raise ValueError("Pose must be a list of 7 elements: [x, y, z, qx, qy, qz, qw]")
+        if not np.isclose(np.linalg.norm(pose[3:]), 1.0):
+            raise ValueError("Quaternion must be a unit quaternion.")
+        
+        self.send_arm_cartesian_hybrid(
+                    pos_xyz=np.array(pose[:3]),
+                    quat_xyzw=np.array(pose[3:]),
+                    seconds=2.0,
+                    max_lin_vel=0.25,
+                    max_ang_vel=0.8,
+                    root_frame=frane_name,  # or "vision"
+                )
+
     def _duration_from_seconds(self, sec: float) -> duration_pb2.Duration:
         """Convert float seconds to protobuf Duration (seconds + nanos)."""
         sec = max(0.0, float(sec))
