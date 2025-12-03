@@ -61,7 +61,11 @@ class SpotVRTeleop:
         return self.oculus_reader.get_transformations_and_buttons()
 
     def toggle_recording(self):
-        self.recorder.start() if not self.recorder.is_recording else self.recorder.stop()
+        if not self.recorder.is_recording:
+            self.recorder.start()
+        else:
+            self.recorder.stop()
+            self.spot.reset_pose(pose=[0.7, 0, 0.4, 0, 0, 0, 1]) # x,y,z, qx,qy,qz,qw
 
     def _smooth(self, prev: float, target: float, alpha: float) -> float:
         """1st order filter."""
@@ -97,14 +101,7 @@ class SpotVRTeleop:
             if buttons.get('Y', False):
                 # self.spot.unstow_arm()
                 # Move arm to a ready position
-                self.spot.send_arm_cartesian_hybrid(
-                    pos_xyz=np.array([0.9, 0, 0.2]),
-                    quat_xyzw=np.array([0, 0.7071068, 0, 0.7071068]),
-                    seconds=2.0,
-                    max_lin_vel=0.25,
-                    max_ang_vel=0.8,
-                    root_frame="body",  # or "vision"
-                )
+                self.spot.reset_pose(pose=[0.7, 0, 0.4, 0, 0, 0, 1]) # x,y,z, qx,qy,qz,qw
 
             # ---------------- BASE  (LEFT HAND) -------------------
             lgrip  = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
@@ -249,7 +246,7 @@ class SpotVRTeleop:
                         pos_xyz=np.array(blended_xyz),
                         quat_xyzw=np.array([goal.rot.x, goal.rot.y, goal.rot.z, goal.rot.w]),
                         seconds=0.25,
-                        max_lin_vel=0.30,
+                        max_lin_vel=0.35,
                         max_ang_vel=1.5,
                         root_frame="body",  # or "vision"
                     )
@@ -275,7 +272,7 @@ def main():
     user     = os.environ.get("BOSDYN_CLIENT_USERNAME", "user")
     password = os.environ.get("BOSDYN_CLIENT_PASSWORD", "password")
 
-    meta_ip = get_connecteed_device_ip()
+    meta_ip = "192.168.1.35" #get_connecteed_device_ip()
     if meta_ip is None:
         print("[!] Could not find connected Meta Quest device IP via ADB.")
         print("    Please ensure ADB is set up and allowed access.")
