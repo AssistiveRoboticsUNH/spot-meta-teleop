@@ -27,10 +27,12 @@ class SpotVRTeleop:
     MAX_VEL_Y = 0.6          # [m/s] left/right
     MAX_YAW   = 0.8          # [rad/s] spin
     ARM_SCALE = 2.0          # [m per m] controller-to-arm translation
+    DEFAULT_POSE = [0.7, 0, 0.4, 0, 0, 0, 1] # x,y,z, qx,qy,qz,qw
 
     VEL_SMOOTH_ALPHA = 0.35  # simple first-order smoothing for base
 
-    def __init__(self, robot_ip, username, password, meta_quest_ip=None, demo_image_preview=True):
+
+    def __init__(self, robot_ip, username, password, home_pose=None, meta_quest_ip=None, demo_image_preview=True):
         self.oculus_reader = OculusReader(ip_address=meta_quest_ip)
         self.spot = SpotRobotController(robot_ip, username, password)
         self.logger = logging.getLogger("vr-teleop")
@@ -40,6 +42,11 @@ class SpotVRTeleop:
         self.arm_anchor_robot = None   # SE3Pose   ^ … corresponding robot pose
         self.prev_r_grip      = False
         self.base_enabled     = False
+
+        if home_pose == None:
+            self.home_pose = self.DEFAULT_POSE
+        else:
+            self.home_pose = home_pose
 
         # Base smoothing state
         self._vx_f = 0.0
@@ -65,7 +72,7 @@ class SpotVRTeleop:
             self.recorder.start()
         else:
             self.recorder.stop()
-            self.spot.reset_pose(pose=[0.7, 0, 0.4, 0, 0, 0, 1]) # x,y,z, qx,qy,qz,qw
+            self.spot.reset_pose(pose=self.home_pose) # x,y,z, qx,qy,qz,qw
 
     def _smooth(self, prev: float, target: float, alpha: float) -> float:
         """1st order filter."""
@@ -101,7 +108,7 @@ class SpotVRTeleop:
             if buttons.get('Y', False):
                 # self.spot.unstow_arm()
                 # Move arm to a ready position
-                self.spot.reset_pose(pose=[0.7, 0, 0.4, 0, 0, 0, 1]) # x,y,z, qx,qy,qz,qw
+                self.spot.reset_pose(pose=self.home_pose) # x,y,z, qx,qy,qz,qw
 
             # ---------------- BASE  (LEFT HAND) -------------------
             lgrip  = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
@@ -241,10 +248,12 @@ class SpotVRTeleop:
                         #             f"F_body={F_body.round(2)}  n={n_c.round(3)}")
                         # except Exception:
                         #     pass
-
+                    cmd_pos = np.array(blended_xyz)
+                    cmd_quat = np.array([goal.rot.x, goal.rot.y, goal.rot.z, goal.rot.w])
+                    print(f"[ARM CMD] pos={np.round(cmd_pos,4).tolist()} quat={np.round(cmd_quat,4).tolist()}")
                     self.spot.send_arm_cartesian_hybrid(
-                        pos_xyz=np.array(blended_xyz),
-                        quat_xyzw=np.array([goal.rot.x, goal.rot.y, goal.rot.z, goal.rot.w]),
+                        pos_xyz=cmd_pos,
+                        quat_xyzw=cmd_quat,
                         seconds=0.25,
                         max_lin_vel=0.35,
                         max_ang_vel=1.5,
@@ -281,7 +290,8 @@ def main():
     print(f"Connecting to Spot at {robot_ip} ...")
     print(f"user: {user}, password: {len(password) * '*'}")
 
-    teleop = SpotVRTeleop(robot_ip, user, password, meta_quest_ip= meta_ip, demo_image_preview=False)
+    home_pose = [0.55, 0.0, 0.55, 0.0, 0.5, 0, 0.8660254]
+    teleop = SpotVRTeleop(robot_ip, user, password, home_pose=home_pose, meta_quest_ip= meta_ip, demo_image_preview=False)
     teleop.run()
 
 if __name__ == "__main__":
