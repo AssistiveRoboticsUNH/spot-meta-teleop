@@ -60,6 +60,7 @@ class SpotVRTeleop:
             robot=self.spot.robot,
             spot_images=self.spot.spot_images,
             state_client=self.spot.state_client,
+            image_size = (320, 240),  # maintaining 4:3 aspect ratio
             out_dir="demos",
             fps=10,
             preview=self.demo_image_preview)

@@ -88,7 +88,7 @@ Each saved .npz contains one “session” dictionary with the following key
 
 | Key                   | Shape                 | Description                                                                        |
 | --------------------- | --------------------- | ---------------------------------------------------------------------------------- |
-| **images**            | `(N,)` (dtype=object) | A length‑N array of OpenCV BGR frames; each element is an `HxW×3` `uint8` ndarray. |
+| **images_0**          | `(N,H,W,C)` (dtype=object) | A length‑N array of OpenCV BGR frames; each element is an `HxW×3` `uint8` ndarray. |
 | **arm\_joint\_names** | `(J,)` (dtype=`<U…`)  | The J joint‐names (strings) for all recorded “arm0.\*” joints.                     |
 | **arm\_q**            | `(N, J)` (float32)    | Joint positions at each timestep.                                                  |
 | **arm\_dq**           | `(N, J)` (float32)    | Joint velocities at each timestep.                                                 |
@@ -97,6 +97,7 @@ Each saved .npz contains one “session” dictionary with the following key
 | **body\_vel**         | `(N, 6)` (float32)    | Body linear & angular velocity in vision frame: `[vx,vy,vz,wx,wy,wz]`.             |
 | **gripper**           | `(N, 1)` (float32)    | Gripper opening percentage.                                                        |
 | **ee\_force**         | `(N, 3)` (float32)    | Estimated end‑effector force vector in hand.                                       |
+| **images\_0\_depth**  | `(N,H,W)` (dtype=object) | Raw hand‑camera depth frames (`HxW` `uint16`). No colorization is applied.         |
 | **t**                 | `(N, 1)` (float64)    | Timestamp for each capture, in seconds (including fractional).                     |
 
 ## 📂 Dataset Structure (.h5)
@@ -115,7 +116,8 @@ data/
 |        ├── eef_pos                (shape=(N, 3), dtype=float32)
 |        ├── eef_quat               (shape=(N, 4), dtype=float32)
 |        ├── gripper                (shape=(N, 1), dtype=float32)
-|        ├── images_0               (shape=(N, 480, 640, 3), dtype=uint8)
+|        ├── images_0               (shape=(N, 240, 320, 3), dtype=uint8)
+|        ├── images_0_depth         (shape=(N, 240, 320), dtype=uint16)
 |        ├── t                      (shape=(N, 1), dtype=float32)
 |        └── vision_in_body         (shape=(N, 7), dtype=float32)
 ├── demo_1/

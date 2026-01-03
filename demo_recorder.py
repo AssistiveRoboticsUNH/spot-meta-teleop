@@ -60,12 +60,15 @@ class DemoRecorder:
         out_dir: str = "demos",
         fps: float = 10.0,
         preview: bool = False,
+        image_size: Optional[tuple[int, int]] = None, # Default is 640x480 from spot hand camera
     ):
         self.robot         = robot
         self.spot_images   = spot_images
         self.state_client  = state_client
         self.fps           = fps
         self.preview       = preview
+        self.image_size    = image_size
+        self._image_size_checked = False
 
         self._latest_frame = None
         self._frame_lock = threading.Lock()
@@ -88,6 +91,35 @@ class DemoRecorder:
         self._save_thread: Optional[threading.Thread] = None
 
         self.is_recording = False
+    
+    def _validate_image_size(self, frame_shape: tuple[int, int]) -> bool:
+        if self.image_size is None or self._image_size_checked:
+            return True
+        src_h, src_w = frame_shape
+        req_w, req_h = self.image_size
+        if req_w <= 0 or req_h <= 0:
+            print("[DemoRecorder] image_size must be positive (w, h).")
+            self._stop_evt.set()
+            return False
+        if req_w > src_w or req_h > src_h:
+            print(f"[DemoRecorder] image_size {req_w}x{req_h} exceeds source {src_w}x{src_h}.")
+            self._stop_evt.set()
+            return False
+        if req_w * src_h != req_h * src_w:
+            print(f"[DemoRecorder] image_size {req_w}x{req_h} does not match source aspect ratio {src_w}x{src_h}.")
+            self._stop_evt.set()
+            return False
+        self._image_size_checked = True
+        return True
+
+    def _resize_frame(self, frame: np.ndarray, is_depth: bool) -> np.ndarray:
+        if self.image_size is None:
+            return frame
+        req_w, req_h = self.image_size
+        if frame.shape[:2] == (req_h, req_w):
+            return frame
+        interp = cv2.INTER_NEAREST if is_depth else cv2.INTER_AREA
+        return cv2.resize(frame, (req_w, req_h), interpolation=interp)
 
     # ---------------- public control ------------------------------------ #
     def start(self):
@@ -189,6 +221,14 @@ class DemoRecorder:
 
                 if frame is None:
                     raise RuntimeError("Failed to retrieve hand color image.")
+
+                if self.image_size is not None:
+                    if not self._validate_image_size(frame.shape[:2]):
+                        return
+                    frame = self._resize_frame(frame, is_depth=False)
+                    if depth_frame is not None:
+                        depth_frame = self._resize_frame(depth_frame, is_depth=True)
+
                 if self.SAVE_DEPTH and depth_frame is None:
                     # Keep lengths aligned; fall back to zeros if depth missing.
                     depth_frame = np.zeros(frame.shape[:2], dtype=np.uint16)
@@ -294,4 +334,3 @@ class DemoRecorder:
 
         np.savez_compressed(fname, **session)
         print(f"[DemoRecorder] Wrote {fname}")
-
