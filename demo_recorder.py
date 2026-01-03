@@ -34,12 +34,13 @@ from typing import Dict, Optional, List
 
 from bosdyn.api import image_pb2, geometry_pb2
 from bosdyn.client import math_helpers
+from spot_images import CameraSource
 from utils.spot_utils import pose_to_vec, frame_pose, image_to_cv
 
 
 def play_sound(path: str, block = False):
     # -q = quiet, removes console output; omit if you want to see mpg123 logs
-    player = subprocess.Popen(["mpg123", "-q", "media/start.mp3"])
+    player = subprocess.Popen(["mpg123", "-q", path])
     if block:
         player.wait()
 
@@ -48,6 +49,9 @@ def play_sound(path: str, block = False):
 # ------------------------------------------------------------------ #
 
 class DemoRecorder:
+    # Toggle to enable/disable recording depth images alongside RGB frames.
+    SAVE_DEPTH: bool = False
+
     def __init__(
         self,
         robot,
@@ -76,8 +80,12 @@ class DemoRecorder:
 
         # data buffers (grow until stop())
         self._frames:      List[np.ndarray]     = []
+        self._depth_frames: List[np.ndarray]    = []
         self._state_bufs:  Dict[str, List[np.ndarray]] = {}
         self._joint_names: Optional[np.ndarray] = None
+        hand_streams = ["visual", "depth_registered"] if self.SAVE_DEPTH else ["visual"]
+        self._hand_camera_sources = [CameraSource("hand", hand_streams)]
+        self._save_thread: Optional[threading.Thread] = None
 
         self.is_recording = False
 
@@ -92,6 +100,7 @@ class DemoRecorder:
             return
         # clear old buffers
         self._frames.clear()
+        self._depth_frames.clear()
         self._state_bufs.clear()
         self._joint_names = None
         self._stop_evt.clear()
@@ -107,6 +116,10 @@ class DemoRecorder:
         
 
     def stop(self):
+        if self._save_thread is not None and self._save_thread.is_alive():
+            print("[DemoRecorder] Save already in progress; ignoring request.")
+            return
+
         print("[DemoRecorder] Stopping...")
         self._stop_evt.set()
         self._thread.join(timeout=2.0)
@@ -117,13 +130,18 @@ class DemoRecorder:
         except Exception as e:
                 print(f"[DemoRecorder] Play sound error: {e}")
 
-        self._flush_to_disk()
-        self.is_recording = False
-        print("[DemoRecorder] Stopped and saved session.")
-        try:
-            play_sound('media/saved.mp3')
-        except Exception as e:
+        # Write to disk on a background thread to avoid blocking teleop / robot activity.
+        def _save_job():
+            self._flush_to_disk()
+            self.is_recording = False
+            print("[DemoRecorder] Stopped and saved session.")
+            try:
+                play_sound('media/saved.mp3')
+            except Exception as e:
                 print(f"[DemoRecorder] Play sound error: {e}")
+
+        self._save_thread = threading.Thread(target=_save_job, daemon=True)
+        self._save_thread.start()
 
     def poll_preview(self):
         """Call this periodically from the main thread to show the latest frame."""
@@ -156,9 +174,29 @@ class DemoRecorder:
                 continue
             next_t += period
             try:
-                frame = image_to_cv(self.spot_images.get_hand_rgb_image())
+                # Single RPC for hand color + registered depth to reduce overhead.
+                img_entries = self.spot_images.get_images_by_cameras(self._hand_camera_sources)
+                color_resp, depth_resp = None, None
+                if img_entries:
+                    for entry in img_entries:
+                        if entry.image_type == "visual":
+                            color_resp = entry.image_response
+                        elif entry.image_type == "depth_registered":
+                            depth_resp = entry.image_response
+
+                frame = image_to_cv(color_resp) if color_resp else None
+                depth_frame = image_to_cv(depth_resp) if depth_resp else None
+
+                if frame is None:
+                    raise RuntimeError("Failed to retrieve hand color image.")
+                if self.SAVE_DEPTH and depth_frame is None:
+                    # Keep lengths aligned; fall back to zeros if depth missing.
+                    depth_frame = np.zeros(frame.shape[:2], dtype=np.uint16)
+
                 state = self.state_client.get_robot_state()
                 self._frames.append(frame)
+                if self.SAVE_DEPTH:
+                    self._depth_frames.append(depth_frame)
                 vecs  = self._extract_state(state)
                 for k, v in vecs.items():
                     self._state_bufs.setdefault(k, []).append(v)
@@ -231,11 +269,20 @@ class DemoRecorder:
             print("[DemoRecorder] Nothing captured - no file written.")
             return
 
+        # Defensive: ensure depth buffer length matches frames.
+        if self.SAVE_DEPTH and len(self._depth_frames) < len(self._frames):
+            missing = len(self._frames) - len(self._depth_frames)
+            filler_shape = self._frames[0].shape[:2]
+            filler = [np.zeros(filler_shape, dtype=np.uint16) for _ in range(missing)]
+            self._depth_frames.extend(filler)
+
         # build session dict
         session = {
             "images_0" : np.array(self._frames, dtype=object),   # ragged
             "arm_joint_names" : self._joint_names,
         }
+        if self.SAVE_DEPTH:
+            session["images_0_depth"] = np.array(self._depth_frames, dtype=object)
         for k, lst in self._state_bufs.items():
             session[k] = np.stack(lst)
 

@@ -61,6 +61,14 @@ def build_hdf5_from_npz(demos_dir: Path, h5_path: Path):
             frames = np.stack(frames, axis=0)                # (N,H,W,3)
             obs_grp.create_dataset("images_0", data=frames[:-1], compression="gzip")
 
+            # depth images (raw uint16, no colorization) -----------------------
+            if "images_0_depth" in data.files:
+                depth_frames = [img.astype(np.uint16) for img in data["images_0_depth"]]
+                depth_frames = np.stack(depth_frames, axis=0)  # (N,H,W)
+                obs_grp.create_dataset("images_0_depth", data=depth_frames[:-1], compression="gzip")
+            else:
+                print(f"[WARN] {npz_path.name} missing 'images_0_depth'")
+
             # split pose -------------------------------------------------------
             eef_pose   = data["ee_pose"].astype(np.float32)  # (N,7)
             eef_pos    = eef_pose[:, :3]                     # (N,3)
