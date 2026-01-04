@@ -91,6 +91,7 @@ class DemoRecorder:
         self._save_thread: Optional[threading.Thread] = None
 
         self.is_recording = False
+        self._printed_intrinsics = False
     
     def _validate_image_size(self, frame_shape: tuple[int, int]) -> bool:
         if self.image_size is None or self._image_size_checked:
@@ -120,6 +121,59 @@ class DemoRecorder:
             return frame
         interp = cv2.INTER_NEAREST if is_depth else cv2.INTER_AREA
         return cv2.resize(frame, (req_w, req_h), interpolation=interp)
+
+    def _print_intrinsics_once(self, img_resp: image_pb2.ImageResponse) -> None:
+        if self._printed_intrinsics or img_resp is None:
+            return
+        src = img_resp.source
+        rows, cols = img_resp.shot.image.rows, img_resp.shot.image.cols
+        model = src.WhichOneof("camera_models")
+        print(f"[DemoRecorder] Camera: {src.name} ({cols}x{rows}), model={model}")
+        if model == "pinhole":
+            intr = src.pinhole.intrinsics
+            fx, fy = intr.focal_length.x, intr.focal_length.y
+            cx, cy = intr.principal_point.x, intr.principal_point.y
+            print(f"[DemoRecorder] Original intrinsics: fx={fx:.3f} fy={fy:.3f} "
+                  f"cx={cx:.3f} cy={cy:.3f}")
+        elif model == "pinhole_brown_conrady":
+            intr = src.pinhole_brown_conrady.intrinsics
+            pin = intr.pinhole_intrinsics
+            fx, fy = pin.focal_length.x, pin.focal_length.y
+            cx, cy = pin.principal_point.x, pin.principal_point.y
+            print(f"[DemoRecorder] Original intrinsics: fx={fx:.3f} fy={fy:.3f} "
+                  f"cx={cx:.3f} cy={cy:.3f}")
+            dist = (intr.k1, intr.k2, intr.p1, intr.p2, intr.k3)
+            print(f"[DemoRecorder] Distortion (original): "
+                  f"k1={dist[0]:.6f} k2={dist[1]:.6f} p1={dist[2]:.6f} "
+                  f"p2={dist[3]:.6f} k3={dist[4]:.6f}")
+        elif model == "kannala_brandt":
+            intr = src.kannala_brandt.intrinsics
+            pin = intr.pinhole_intrinsics
+            fx, fy = pin.focal_length.x, pin.focal_length.y
+            cx, cy = pin.principal_point.x, pin.principal_point.y
+            print(f"[DemoRecorder] Original intrinsics: fx={fx:.3f} fy={fy:.3f} "
+                  f"cx={cx:.3f} cy={cy:.3f}")
+            dist = (intr.k1, intr.k2, intr.k3, intr.k4)
+            print(f"[DemoRecorder] Distortion (original): "
+                  f"k1={dist[0]:.6f} k2={dist[1]:.6f} k3={dist[2]:.6f} k4={dist[3]:.6f}")
+        else:
+            print("[DemoRecorder] Camera intrinsics not available in response.")
+            self._printed_intrinsics = True
+            return
+
+        if self.image_size is not None:
+            req_w, req_h = self.image_size
+            sx = req_w / float(cols)
+            sy = req_h / float(rows)
+            fx_s, fy_s = fx * sx, fy * sy
+            cx_s, cy_s = cx * sx, cy * sy
+            print(f"[DemoRecorder] Scaled intrinsics ({req_w}x{req_h}): "
+                  f"fx={fx_s:.3f} fy={fy_s:.3f} cx={cx_s:.3f} cy={cy_s:.3f}")
+            if model == "pinhole_brown_conrady":
+                print("[DemoRecorder] Distortion (scaled): unchanged by resize")
+            elif model == "kannala_brandt":
+                print("[DemoRecorder] Distortion (scaled): unchanged by resize")
+        self._printed_intrinsics = True
 
     # ---------------- public control ------------------------------------ #
     def start(self):
@@ -215,6 +269,9 @@ class DemoRecorder:
                             color_resp = entry.image_response
                         elif entry.image_type == "depth_registered":
                             depth_resp = entry.image_response
+
+                if not self._printed_intrinsics:
+                    self._print_intrinsics_once(color_resp or depth_resp)
 
                 frame = image_to_cv(color_resp) if color_resp else None
                 depth_frame = image_to_cv(depth_resp) if depth_resp else None
