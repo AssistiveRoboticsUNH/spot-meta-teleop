@@ -55,6 +55,10 @@ class SpotRobotController:
         """
         self.arm_base_frame = arm_base_frame
         self.t_exec     = default_exec_time
+        # Integrate deltas on a target pose to decouple from observation latency.
+        self._arm_target_pos = None
+        self._arm_target_quat = None
+        self._arm_target_frame = None
 
         # --- connect & auth ------------------------------------------------
         sdk   = create_standard_sdk("spot-controller")
@@ -145,6 +149,13 @@ class SpotRobotController:
             rotation=geometry_pb2.Quaternion(x=float(quat_xyzw[0]), y=float(quat_xyzw[1]),
                                             z=float(quat_xyzw[2]), w=float(quat_xyzw[3]))
     )
+
+    def _ensure_arm_target(self, frame_name: str):
+        if self._arm_target_pos is None or self._arm_target_quat is None or self._arm_target_frame != frame_name:
+            pos, quat = self.current_ee_pose(frame_name)
+            self._arm_target_pos = pos.copy()
+            self._arm_target_quat = quat.copy()
+            self._arm_target_frame = frame_name
 
     # ─── public API ──────────────────────────────────────────────────────
 
@@ -247,7 +258,9 @@ class SpotRobotController:
         if action.shape != (10,):
             raise ValueError("Action must be np.ndarray with shape (10,)")
 
-        pos, quat = self.current_ee_pose()
+        self._ensure_arm_target(frame_name)
+        pos = self._arm_target_pos
+        quat = self._arm_target_quat
 
         delta_p   = action[:3]
         rot6d     = action[3:9]
@@ -260,6 +273,8 @@ class SpotRobotController:
         R_cmd     = R_curr @ R_rel
         quat_cmd  = matrix_to_quat(R_cmd)
 
+        self._arm_target_pos = pos_cmd
+        self._arm_target_quat = quat_cmd
         # --- send to robot ---------------------------------------------
         print(f"Position({pos_cmd}), Quat({quat_cmd})")
         self.move_arm_to(pos_cmd, quat_cmd, g_target, frame_name)
@@ -374,7 +389,7 @@ class SpotRobotController:
         if not np.isclose(np.linalg.norm(pose[3:]), 1.0):
             raise ValueError("Quaternion must be a unit quaternion.")
         
-        self.send_arm_cartesian_hybrid(
+        cmd_id = self.send_arm_cartesian_hybrid(
                     pos_xyz=np.array(pose[:3]),
                     quat_xyzw=np.array(pose[3:]),
                     seconds=2.0,
@@ -382,6 +397,17 @@ class SpotRobotController:
                     max_ang_vel=0.8,
                     root_frame=frane_name,  # or "vision"
                 )
+        try:
+            block_until_arm_arrives(self.command_client, cmd_id)
+        except Exception as e:
+            print(f"[!] Error waiting for reset pose: {e}")
+        try:
+            pos, quat = self.current_ee_pose(frane_name)
+            self._arm_target_pos = pos.copy()
+            self._arm_target_quat = quat.copy()
+            self._arm_target_frame = frane_name
+        except Exception as e:
+            print(f"[!] Error syncing target pose after reset: {e}")
 
     def _duration_from_seconds(self, sec: float) -> duration_pb2.Duration:
         """Convert float seconds to protobuf Duration (seconds + nanos)."""
