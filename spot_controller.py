@@ -25,12 +25,13 @@ import numpy as np
 # ───── Spot SDK ─────────────────────────────────────────────────────────── #
 from bosdyn.client           import create_standard_sdk
 from bosdyn.client.lease     import LeaseClient, LeaseKeepAlive, ResourceAlreadyClaimedError
-from bosdyn.client.robot_command import RobotCommandBuilder, blocking_stand, blocking_sit, block_until_arm_arrives
+from bosdyn.client.robot_command import RobotCommandBuilder, blocking_stand, blocking_sit, block_until_arm_arrives, block_for_trajectory_cmd
 from bosdyn.client.robot_state    import RobotStateClient
 from bosdyn.client.estop   import EstopClient, EstopEndpoint, EstopKeepAlive
 from bosdyn.client.frame_helpers  import get_a_tform_b, VISION_FRAME_NAME, BODY_FRAME_NAME
 from bosdyn.client.docking           import DockingClient, blocking_dock_robot, blocking_undock, get_dock_id
 from bosdyn.api              import geometry_pb2, arm_command_pb2, trajectory_pb2, robot_command_pb2, synchronized_command_pb2
+from bosdyn.api.spot         import robot_command_pb2 as spot_command_pb2
 from google.protobuf import duration_pb2
 from bosdyn.client.math_helpers  import SE3Pose, Quat
 from bosdyn.client.gripper_camera_param import GripperCameraParamClient
@@ -240,15 +241,79 @@ class SpotRobotController:
         except Exception as e:
             print(f"[!] Error sending velocity command: {e}")
 
-    def move_base_to(self, goal_x: float, goal_y: float, goal_heading: float, timeout, frame_name: str = VISION_FRAME_NAME):
+    def move_base_to(self, goal_x: float, goal_y: float, goal_heading: float, timeout, frame_name: str = VISION_FRAME_NAME, blocking: bool = False, max_lin_vel: float = 0.6, max_ang_vel: float = 0.8):
         """Send a position command to the robot base with respect to a given frame.(by default, vision frame)"""
         try:
-            pos_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(goal_x, goal_y, goal_heading, frame_name)
-            self.command_client.robot_command(pos_cmd, end_time_secs= time.time() + float(timeout))
+            max_lin_vel = float(max_lin_vel)
+            max_ang_vel = float(max_ang_vel)
+            if max_lin_vel <= 0.0 or max_ang_vel <= 0.0:
+                raise ValueError("max_lin_vel and max_ang_vel must be > 0.")
+
+            speed_limit = geometry_pb2.SE2VelocityLimit(
+                max_vel=geometry_pb2.SE2Velocity(
+                    linear=geometry_pb2.Vec2(x=max_lin_vel, y=max_lin_vel),
+                    angular=max_ang_vel,
+                ),
+                min_vel=geometry_pb2.SE2Velocity(
+                    linear=geometry_pb2.Vec2(x=-max_lin_vel, y=-max_lin_vel),
+                    angular=-max_ang_vel,
+                ),
+            )
+            mobility_params = spot_command_pb2.MobilityParams(vel_limit=speed_limit)
+
+            pos_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(
+                goal_x, goal_y, goal_heading, frame_name, params=mobility_params
+            )
+            cmd_id = self.command_client.robot_command(pos_cmd, end_time_secs= time.time() + float(timeout))
+            if blocking:
+                block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=float(timeout))
         except Exception as e:
             print(f"[!] Error sending position command: {e}")
 
-    def apply_action(self, action: np.ndarray, frame_name: str = BODY_FRAME_NAME):
+    def move_base_to_pose(self, goal_pose, timeout, frame_name: str = VISION_FRAME_NAME, blocking: bool = False, max_lin_vel: float = 0.6, max_ang_vel: float = 0.8):
+        """Send a position command to the robot base with respect to a given frame.(by default, vision frame)
+        Parameters
+        ----------
+        goal_pose : [tx, ty, tz, qx, qy, qz, qw] (list or np.ndarray)
+        """
+        # convert to SE2Pose
+        position = geometry_pb2.Vec2(x=goal_pose[0], y=goal_pose[1])
+
+        # calculate yaw from quaternion
+        quat = goal_pose[3:7]
+        yaw = math.atan2(2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
+                         1.0 - 2.0 * (quat[1] * quat[1] + quat[2] * quat[2]))
+        goal_se2 = geometry_pb2.SE2Pose(position=position, angle=yaw)
+
+        
+        try:
+            max_lin_vel = float(max_lin_vel)
+            max_ang_vel = float(max_ang_vel)
+            if max_lin_vel <= 0.0 or max_ang_vel <= 0.0:
+                raise ValueError("max_lin_vel and max_ang_vel must be > 0.")
+
+            speed_limit = geometry_pb2.SE2VelocityLimit(
+                max_vel=geometry_pb2.SE2Velocity(
+                    linear=geometry_pb2.Vec2(x=max_lin_vel, y=max_lin_vel),
+                    angular=max_ang_vel,
+                ),
+                min_vel=geometry_pb2.SE2Velocity(
+                    linear=geometry_pb2.Vec2(x=-max_lin_vel, y=-max_lin_vel),
+                    angular=-max_ang_vel,
+                ),
+            )
+            mobility_params = spot_command_pb2.MobilityParams(vel_limit=speed_limit)
+
+            pos_cmd = RobotCommandBuilder.synchro_se2_trajectory_command(
+                goal_se2, frame_name, params=mobility_params
+            )
+            cmd_id = self.command_client.robot_command(pos_cmd, end_time_secs= time.time() + float(timeout))
+            if blocking:
+                block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=float(timeout))
+        except Exception as e:
+            print(f"[!] Error sending position command: {e}")
+
+    def apply_action(self, action: np.ndarray, verbose=False, frame_name: str = BODY_FRAME_NAME):
         """
         Parameters
         ----------
@@ -276,8 +341,9 @@ class SpotRobotController:
         self._arm_target_pos = pos_cmd
         self._arm_target_quat = quat_cmd
         # --- send to robot ---------------------------------------------
-        print(f"Position({pos_cmd}), Quat({quat_cmd})")
-        self.move_arm_to(pos_cmd, quat_cmd, g_target, frame_name)
+        if verbose:
+            print(f"Position({pos_cmd}), Quat({quat_cmd})")
+        self.move_arm_to(pos_cmd, quat_cmd, g_target, verbose, frame_name)
         
     def undock(self):
         try:
