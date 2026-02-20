@@ -13,6 +13,7 @@ Author: Moniruzzaman Akash
 import argparse, math, signal, sys, time, os
 import numpy as np
 from typing import Tuple, Dict
+import threading
 
 from bosdyn.client.frame_helpers import get_a_tform_b, VISION_FRAME_NAME, BODY_FRAME_NAME
 from spot_controller import SpotRobotController
@@ -21,6 +22,10 @@ from reader import OculusReader, get_connecteed_device_ip
 from demo_recorder import DemoRecorder
 from utils.spot_utils import mat_to_se3, map_controller_to_robot
 import logging
+try:
+    from pynput import keyboard
+except Exception:
+    keyboard = None
 
 class SpotVRTeleop:
     MAX_VEL_X = 0.6          # [m/s] forward/back
@@ -64,6 +69,64 @@ class SpotVRTeleop:
             out_dir="demos",
             fps=10,
             preview=self.demo_image_preview)
+        self._kb_once = set()
+        self._kb_held = set()
+        self._kb_lock = threading.Lock()
+        self._kb_listener = None
+        self._start_keyboard_listener()
+        self._prev_meta_abxy = {"a": False, "b": False, "x": False, "y": False}
+
+    def _start_keyboard_listener(self):
+        if keyboard is None:
+            self.logger.warning("pynput not available; keyboard A/B/X/Y shortcuts disabled.")
+            return
+        self._kb_listener = keyboard.Listener(on_press=self._on_key_press, on_release=self._on_key_release)
+        self._kb_listener.daemon = True
+        self._kb_listener.start()
+
+    def _on_key_press(self, key):
+        try:
+            k = key.char.lower()
+        except AttributeError:
+            return
+        if k not in {"a", "b", "x", "y"}:
+            return
+        with self._kb_lock:
+            if k not in self._kb_held:
+                self._kb_held.add(k)
+                self._kb_once.add(k)
+
+    def _on_key_release(self, key):
+        try:
+            k = key.char.lower()
+        except AttributeError:
+            return
+        with self._kb_lock:
+            self._kb_held.discard(k)
+
+    def _consume_key_once(self, key_name: str) -> bool:
+        with self._kb_lock:
+            if key_name in self._kb_once:
+                self._kb_once.remove(key_name)
+                return True
+        return False
+
+    def _button_pressed(self, buttons: Dict, *names: str, threshold: float = 0.5) -> bool:
+        for name in names:
+            if name not in buttons:
+                continue
+            v = buttons.get(name)
+            if isinstance(v, (bool, np.bool_)):
+                return bool(v)
+            if isinstance(v, (int, float, np.integer, np.floating)):
+                return float(v) > threshold
+            if isinstance(v, (tuple, list, np.ndarray)) and len(v) > 0:
+                try:
+                    return float(v[0]) > threshold
+                except Exception:
+                    return bool(v[0])
+            return bool(v)
+        return False
 
     def get_meta_quest(self):
         return self.oculus_reader.get_transformations_and_buttons()
@@ -98,18 +161,38 @@ class SpotVRTeleop:
                 time.sleep(dt)
                 continue
 
+            key_a = self._consume_key_once("a")
+            key_b = self._consume_key_once("b")
+            key_x = self._consume_key_once("x")
+            key_y = self._consume_key_once("y")
+
+            meta_a = self._button_pressed(buttons, "A", "a")
+            meta_b = self._button_pressed(buttons, "B", "b")
+            meta_x = self._button_pressed(buttons, "X", "x")
+            meta_y = self._button_pressed(buttons, "Y", "y")
+
+            trig_a = key_a or (meta_a and not self._prev_meta_abxy["a"])
+            trig_b = key_b or (meta_b and not self._prev_meta_abxy["b"])
+            trig_x = key_x or (meta_x and not self._prev_meta_abxy["x"])
+            trig_y = key_y or (meta_y and not self._prev_meta_abxy["y"])
+
             # ---------------- POWER TOGGLE (A/B) ------------------
-            if buttons.get('A', False):
+            if trig_a:
                 self.spot.dock_undock()
-            if buttons.get('B', False):
+            if trig_b:
                 self.toggle_recording()
             # ------------------ STOW/UNSTOW ARM -------------------
-            if buttons.get('X', False):
+            if trig_x:
                 self.spot.stow_arm()
-            if buttons.get('Y', False):
+            if trig_y:
                 # self.spot.unstow_arm()
                 # Move arm to a ready position
                 self.spot.reset_pose(pose=self.home_pose) # x,y,z, qx,qy,qz,qw
+
+            self._prev_meta_abxy["a"] = meta_a
+            self._prev_meta_abxy["b"] = meta_b
+            self._prev_meta_abxy["x"] = meta_x
+            self._prev_meta_abxy["y"] = meta_y
 
             # ---------------- BASE  (LEFT HAND) -------------------
             lgrip  = buttons.get('leftGrip', (0.0,))[0] > 0.5 or buttons.get('LG', False)
