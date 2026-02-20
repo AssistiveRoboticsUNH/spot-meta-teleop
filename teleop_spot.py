@@ -75,6 +75,8 @@ class SpotVRTeleop:
         self._kb_listener = None
         self._start_keyboard_listener()
         self._prev_meta_abxy = {"a": False, "b": False, "x": False, "y": False}
+        self.force_limit_enabled = False
+        self._Ff = np.zeros(3, dtype=float)
 
     def _start_keyboard_listener(self):
         if keyboard is None:
@@ -141,6 +143,68 @@ class SpotVRTeleop:
     def _smooth(self, prev: float, target: float, alpha: float) -> float:
         """1st order filter."""
         return (1 - alpha) * prev + alpha * target
+
+    def _apply_force_limit(self, delta_cmd: np.ndarray, pose_now, soft_limits: np.ndarray, hard_limits: np.ndarray) -> np.ndarray:
+        """Limit commanded translational delta based on end-effector force."""
+        PARALLEL_MIN_SCALE = 0.0   # residual motion allowed along normal at/above hard (0..1)
+        F_DETECT = 0.8             # N; ignore tiny forces to avoid flicker
+        ALPHA_F = 0.2              # force EWMA smoothing factor
+
+        if np.linalg.norm(delta_cmd) < 1e-9:
+            return delta_cmd
+
+        man = self.spot.state_client.get_robot_state().manipulator_state
+        fH = man.estimated_end_effector_force_in_hand
+        f_hand = np.array([fH.x, fH.y, fH.z], dtype=float)
+
+        # BODY <- HAND rotation from CURRENT EE pose
+        try:
+            R_BH = pose_now.rot.to_matrix()
+        except AttributeError:
+            qx, qy, qz, qw = pose_now.rot.x, pose_now.rot.y, pose_now.rot.z, pose_now.rot.w
+            R_BH = np.array([
+                [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+            ], dtype=float)
+
+        F_body = R_BH @ f_hand
+
+        # smooth force a bit to avoid chatter
+        self._Ff = (1.0 - ALPHA_F) * self._Ff + ALPHA_F * F_body
+        F_body = self._Ff
+        normF = float(np.linalg.norm(F_body))
+
+        delta_out = delta_cmd
+        if normF > F_DETECT:
+            # contact normal to LIMIT ALONG = INTO the surface = -unit(force)
+            n_c = -F_body / (normF + 1e-9)
+
+            # decompose commanded delta w.r.t. contact normal
+            d_par_mag = float(np.dot(delta_cmd, n_c))  # >0 = moving INTO contact
+            d_par = d_par_mag * n_c
+            d_ortho = delta_cmd - d_par
+
+            if d_par_mag > 0.0:
+                # effective thresholds along n_c (tightest axis wins)
+                abs_nc = np.abs(n_c) + 1e-9
+                soft_eff = float(np.min(soft_limits / abs_nc))
+                hard_eff = float(np.min(hard_limits / abs_nc))
+
+                # scale alpha(F): 1 -> PARALLEL_MIN_SCALE as force rises from soft->hard
+                if normF <= soft_eff:
+                    alpha = 1.0
+                elif normF >= hard_eff:
+                    alpha = PARALLEL_MIN_SCALE
+                else:
+                    k = (normF - soft_eff) / (hard_eff - soft_eff + 1e-9)
+                    alpha = (1.0 - k) * (1.0 - PARALLEL_MIN_SCALE) + PARALLEL_MIN_SCALE
+
+                delta_out = d_ortho + alpha * d_par
+            else:
+                delta_out = delta_cmd  # moving away or tangential -> don't restrict
+
+        return delta_out
     
     def run(self):
         rate_hz = 30.0
@@ -259,69 +323,12 @@ class SpotVRTeleop:
                     # per-tick commanded delta in BODY
                     delta_cmd = desired_xyz - x_now
 
-                    if np.linalg.norm(delta_cmd) < 1e-9:
-                        blended_xyz = desired_xyz
+                    if self.force_limit_enabled:
+                        delta_out = self._apply_force_limit(delta_cmd, pose_now, soft_limits, hard_limits)
                     else:
-                        # --- force in BODY frame ---
-                        man = self.spot.state_client.get_robot_state().manipulator_state
-                        fH = man.estimated_end_effector_force_in_hand
-                        f_hand = np.array([fH.x, fH.y, fH.z], dtype=float)
-
-                        # BODY <- HAND rotation from CURRENT EE pose (not goal)
-                        pose = self.spot.current_ee_pose_se3()
-                        try:
-                            R_BH = pose.rot.to_matrix()  # preferred API
-                        except AttributeError:
-                            # fallback: build from quaternion
-                            qx, qy, qz, qw = pose.rot.x, pose.rot.y, pose.rot.z, pose.rot.w
-                            R_BH = np.array([
-                                [1-2*(qy*qy+qz*qz),   2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
-                                [2*(qx*qy + qz*qw), 1-2*(qx*qx+qz*qz),   2*(qy*qz - qx*qw)],
-                                [2*(qx*qz - qy*qw),   2*(qy*qz + qx*qw), 1-2*(qx*qx+qy*qy)],
-                            ], dtype=float)
-
-                        F_body = R_BH @ f_hand
-
-                        # smooth force a bit to avoid chatter
-                        self._Ff = (1.0 - ALPHA_F) * getattr(self, "_Ff", np.zeros(3)) + ALPHA_F * F_body
-                        F_body = self._Ff
-                        normF = float(np.linalg.norm(F_body))
-
-                        # default: pass-through
                         delta_out = delta_cmd
-
-                        if normF > F_DETECT:
-                            # contact normal to LIMIT ALONG = INTO the surface = -unit(force)
-                            n_c = -F_body / (normF + 1e-9)
-
-                            # decompose commanded delta w.r.t. contact normal
-                            d_par_mag = float(np.dot(delta_cmd, n_c))  # >0 = moving INTO contact
-                            d_par  = d_par_mag * n_c
-                            d_ortho = delta_cmd - d_par
-
-                            # print("d_par_mag:", d_par_mag, "N:", n_c, "F:", np.round(F_body,2), f"||F||={normF:.1f}N")
-
-                            if d_par_mag > 0.0:
-                                # effective thresholds along n_c (tightest axis wins)
-                                abs_nc = np.abs(n_c) + 1e-9
-                                soft_eff = float(np.min(soft_limits / abs_nc))
-                                hard_eff = float(np.min(hard_limits / abs_nc))
-
-                                # scale α(F): 1 → PARALLEL_MIN_SCALE as force rises from soft→hard
-                                if normF <= soft_eff:
-                                    alpha = 1.0
-                                elif normF >= hard_eff:
-                                    alpha = PARALLEL_MIN_SCALE
-                                else:
-                                    k = (normF - soft_eff) / (hard_eff - soft_eff + 1e-9)
-                                    alpha = (1.0 - k) * (1.0 - PARALLEL_MIN_SCALE) + PARALLEL_MIN_SCALE
-
-                                delta_out = d_ortho + alpha * d_par
-                            else:
-                                delta_out = delta_cmd  # moving away or tangential → don’t restrict
-
-                        # convert back to absolute target to send
-                        blended_xyz = x_now + delta_out
+                    # convert back to absolute target to send
+                    blended_xyz = x_now + delta_out
                         
                         # if not hasattr(self, "_dbg_t"): self._dbg_t = 0.0
                         # try:
@@ -375,6 +382,7 @@ def main():
     print(f"user: {user}, password: {len(password) * '*'}")
 
     home_pose = [0.55, 0.0, 0.55, 0.0, 0.5, 0, 0.8660254]
+    # home_pose = [0.6328, 0.0054, 0.3568, -0.7006, -0.1321, -0.018, 0.701]
     teleop = SpotVRTeleop(robot_ip, user, password, home_pose=home_pose, meta_quest_ip= meta_ip, demo_image_preview=False)
     teleop.run()
 
