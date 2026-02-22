@@ -88,7 +88,8 @@ Each saved .npz contains one “session” dictionary with the following key
 
 | Key                   | Shape                 | Description                                                                        |
 | --------------------- | --------------------- | ---------------------------------------------------------------------------------- |
-| **images_0**          | `(N,H,W,C)` (dtype=object) | A length‑N array of OpenCV BGR frames; each element is an `HxW×3` `uint8` ndarray. |
+| **images_0**          | `(N,H,W,C)` (dtype=object) | Eye-in-hand RGB camera frames; each element is an `HxW×3` `uint8` ndarray. |
+| **images_1**          | `(N,H,W,C)` (dtype=object) | Agentview RGB camera stream (`images_x`, x>=1) when external camera(s) are enabled. |
 | **arm\_joint\_names** | `(J,)` (dtype=`<U…`)  | The J joint‐names (strings) for all recorded “arm0.\*” joints.                     |
 | **arm\_q**            | `(N, J)` (float32)    | Joint positions at each timestep.                                                  |
 | **arm\_dq**           | `(N, J)` (float32)    | Joint velocities at each timestep.                                                 |
@@ -97,7 +98,8 @@ Each saved .npz contains one “session” dictionary with the following key
 | **body\_vel**         | `(N, 6)` (float32)    | Body linear & angular velocity in vision frame: `[vx,vy,vz,wx,wy,wz]`.             |
 | **gripper**           | `(N, 1)` (float32)    | Gripper opening percentage.                                                        |
 | **ee\_force**         | `(N, 3)` (float32)    | Estimated end‑effector force vector in hand.                                       |
-| **images\_0\_depth**  | `(N,H,W)` (dtype=object) | Raw hand‑camera depth frames (`HxW` `uint16`). No colorization is applied.         |
+| **images\_0\_depth**  | `(N,H,W)` (dtype=object) | Eye-in-hand depth frames (`HxW` `uint16`). No colorization is applied. |
+| **images\_1\_depth**  | `(N,H,W)` (dtype=object) | Agentview depth stream (`images_x_depth`, x>=1) when external camera(s) are enabled. |
 | **t**                 | `(N, 1)` (float64)    | Timestamp for each capture, in seconds (including fractional).                     |
 
 ## 📂 Dataset Structure (.h5)
@@ -118,6 +120,8 @@ data/
 |        ├── gripper                (shape=(N, 1), dtype=float32)
 |        ├── images_0               (shape=(N, 240, 320, 3), dtype=uint8)
 |        ├── images_0_depth         (shape=(N, 240, 320), dtype=uint16)
+|        ├── images_1               (shape=(N, 240, 320, 3), dtype=uint8)
+|        ├── images_1_depth         (shape=(N, 240, 320), dtype=uint16)
 |        ├── t                      (shape=(N, 1), dtype=float32)
 |        └── vision_in_body         (shape=(N, 7), dtype=float32)
 ├── demo_1/

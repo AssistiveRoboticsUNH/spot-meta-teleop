@@ -26,7 +26,7 @@ def _clean_shutdown(self, *a):
     ...
 """
 from __future__ import annotations
-import time, threading, subprocess
+import time, threading, subprocess, atexit
 import numpy as np
 import cv2
 from pathlib import Path
@@ -36,6 +36,7 @@ from bosdyn.api import image_pb2, geometry_pb2
 from bosdyn.client import math_helpers
 from spot_images import CameraSource
 from utils.spot_utils import pose_to_vec, frame_pose, image_to_cv
+from camera_streamer import CameraStreamer
 
 
 def play_sound(path: str, block = False):
@@ -49,14 +50,14 @@ def play_sound(path: str, block = False):
 # ------------------------------------------------------------------ #
 
 class DemoRecorder:
-    # Toggle to enable/disable recording depth images alongside RGB frames.
-    SAVE_DEPTH: bool = False
 
     def __init__(
         self,
         robot,
         spot_images,
         state_client,
+        external_camera: Optional[CameraStreamer] = None,
+        use_depth: bool = False,
         out_dir: str = "demos",
         fps: float = 10.0,
         preview: bool = False,
@@ -65,12 +66,15 @@ class DemoRecorder:
         self.robot         = robot
         self.spot_images   = spot_images
         self.state_client  = state_client
+        self.external_camera = external_camera
+        self.use_depth     = bool(use_depth)
         self.fps           = fps
         self.preview       = preview
         self.image_size    = image_size
         self._image_size_checked = False
 
         self._latest_frame = None
+        self._latest_ext_frame = None
         self._frame_lock = threading.Lock()
 
 
@@ -84,14 +88,35 @@ class DemoRecorder:
         # data buffers (grow until stop())
         self._frames:      List[np.ndarray]     = []
         self._depth_frames: List[np.ndarray]    = []
+        self._frames_ext: List[np.ndarray]      = []
+        self._depth_frames_ext: List[np.ndarray] = []
         self._state_bufs:  Dict[str, List[np.ndarray]] = {}
         self._joint_names: Optional[np.ndarray] = None
-        hand_streams = ["visual", "depth_registered"] if self.SAVE_DEPTH else ["visual"]
+        hand_streams = ["visual", "depth_registered"] if self.use_depth else ["visual"]
         self._hand_camera_sources = [CameraSource("hand", hand_streams)]
         self._save_thread: Optional[threading.Thread] = None
 
         self.is_recording = False
         self._printed_intrinsics = False
+        self._external_camera_active = False
+        print(
+            f"[DemoRecorder] Recording sources: hand_rgb=enabled, "
+            f"hand_depth={'enabled' if self.use_depth else 'disabled'}"
+        )
+        if self.external_camera is not None:
+            print("[DemoRecorder] External camera source requested: enabled")
+            try:
+                started = self.external_camera.start()
+                if started is False:
+                    print("[DemoRecorder] External camera start returned False (not active).")
+                else:
+                    self._external_camera_active = True
+                    print("[DemoRecorder] External camera source active: RGB+depth")
+                    atexit.register(self.external_camera.stop)
+            except Exception as e:
+                print(f"[DemoRecorder] External camera start error: {e}")
+        else:
+            print("[DemoRecorder] External camera source requested: disabled")
     
     def _validate_image_size(self, frame_shape: tuple[int, int]) -> bool:
         if self.image_size is None or self._image_size_checked:
@@ -187,6 +212,8 @@ class DemoRecorder:
         # clear old buffers
         self._frames.clear()
         self._depth_frames.clear()
+        self._frames_ext.clear()
+        self._depth_frames_ext.clear()
         self._state_bufs.clear()
         self._joint_names = None
         self._stop_evt.clear()
@@ -241,12 +268,33 @@ class DemoRecorder:
                 pass
 
         frame = None
+        ext_frame = None
         with self._frame_lock:
             if self._latest_frame is not None:
                 frame = self._latest_frame.copy()
+            if self._latest_ext_frame is not None:
+                ext_frame = self._latest_ext_frame.copy()
 
         if frame is not None:
-            cv2.imshow("Hand RGB", frame)
+            view = frame
+            if ext_frame is not None:
+                # Show Spot and external feed side by side, matching display height.
+                h = frame.shape[0]
+                if ext_frame.shape[0] != h:
+                    new_w = int(ext_frame.shape[1] * (h / float(ext_frame.shape[0])))
+                    ext_frame = cv2.resize(ext_frame, (max(new_w, 1), h), interpolation=cv2.INTER_AREA)
+                view = np.concatenate([frame, ext_frame], axis=1)
+                try:
+                    cv2.destroyWindow("Hand RGB")
+                except Exception:
+                    pass
+                cv2.imshow("Spot + External RGB", view)
+            else:
+                try:
+                    cv2.destroyWindow("Spot + External RGB")
+                except Exception:
+                    pass
+                cv2.imshow("Hand RGB", view)
             cv2.waitKey(1)  # Allows OpenCV to process UI events
 
     # ---------------- background thread --------------------------------- #
@@ -286,14 +334,25 @@ class DemoRecorder:
                     if depth_frame is not None:
                         depth_frame = self._resize_frame(depth_frame, is_depth=True)
 
-                if self.SAVE_DEPTH and depth_frame is None:
+                if self.use_depth and depth_frame is None:
                     # Keep lengths aligned; fall back to zeros if depth missing.
                     depth_frame = np.zeros(frame.shape[:2], dtype=np.uint16)
 
                 state = self.state_client.get_robot_state()
                 self._frames.append(frame)
-                if self.SAVE_DEPTH:
+                if self.use_depth:
                     self._depth_frames.append(depth_frame)
+
+                ext_rgb = None
+                if self._external_camera_active:
+                    ext_rgb, ext_depth = self.external_camera.get_latest()
+                    if ext_rgb is not None:
+                        self._frames_ext.append(ext_rgb)
+                        if self.use_depth:
+                            if ext_depth is not None:
+                                self._depth_frames_ext.append(ext_depth)
+                            else:
+                                self._depth_frames_ext.append(np.zeros(ext_rgb.shape[:2], dtype=np.uint16))
                 vecs  = self._extract_state(state)
                 for k, v in vecs.items():
                     self._state_bufs.setdefault(k, []).append(v)
@@ -301,6 +360,7 @@ class DemoRecorder:
                 if self.preview:
                     with self._frame_lock:
                         self._latest_frame = frame.copy()
+                        self._latest_ext_frame = None if ext_rgb is None else ext_rgb.copy()
             except Exception as e:
                 print(f"[DemoRecorder] {e}")
 
@@ -367,19 +427,37 @@ class DemoRecorder:
             return
 
         # Defensive: ensure depth buffer length matches frames.
-        if self.SAVE_DEPTH and len(self._depth_frames) < len(self._frames):
+        if self.use_depth and len(self._depth_frames) < len(self._frames):
             missing = len(self._frames) - len(self._depth_frames)
             filler_shape = self._frames[0].shape[:2]
             filler = [np.zeros(filler_shape, dtype=np.uint16) for _ in range(missing)]
             self._depth_frames.extend(filler)
+        save_external = self._external_camera_active and len(self._frames_ext) > 0
+        if save_external and len(self._frames_ext) < len(self._frames):
+            missing = len(self._frames) - len(self._frames_ext)
+            h, w = self._frames_ext[0].shape[:2]
+            filler = [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(missing)]
+            self._frames_ext.extend(filler)
+        if self.use_depth and save_external and len(self._depth_frames_ext) < len(self._frames):
+            missing = len(self._frames) - len(self._depth_frames_ext)
+            if self._depth_frames_ext:
+                h, w = self._depth_frames_ext[0].shape[:2]
+            else:
+                h, w = self._frames_ext[0].shape[:2]
+            filler = [np.zeros((h, w), dtype=np.uint16) for _ in range(missing)]
+            self._depth_frames_ext.extend(filler)
 
         # build session dict
         session = {
             "images_0" : np.array(self._frames, dtype=object),   # ragged
             "arm_joint_names" : self._joint_names,
         }
-        if self.SAVE_DEPTH:
+        if self.use_depth:
             session["images_0_depth"] = np.array(self._depth_frames, dtype=object)
+        if save_external:
+            session["images_1"] = np.array(self._frames_ext, dtype=object)
+            if self.use_depth:
+                session["images_1_depth"] = np.array(self._depth_frames_ext, dtype=object)
         for k, lst in self._state_bufs.items():
             session[k] = np.stack(lst)
 

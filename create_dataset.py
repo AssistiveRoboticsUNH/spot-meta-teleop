@@ -40,6 +40,44 @@ def mat_to_rot6d(R):
                            R[..., :, 1]],  # second column (R01,R11,R21)
                           axis=-1)
 
+
+def _demo_index_key(name: str):
+    if name.startswith("demo_"):
+        tail = name[5:]
+        if tail.isdigit():
+            return int(tail)
+    return float("inf")
+
+
+def print_first_demo_tree(h5_path: Path):
+    with h5py.File(h5_path, "r") as hf:
+        if "data" not in hf or len(hf["data"].keys()) == 0:
+            print("[INFO] No demos found in H5.")
+            return
+
+        demo_names = sorted(hf["data"].keys(), key=_demo_index_key)
+        demo_name = demo_names[0]
+        demo_grp = hf["data"][demo_name]
+
+        print("\n[H5 Tree] First demo")
+        print("data/")
+        print(f"└── {demo_name}/")
+
+        def _print_group(group, prefix):
+            keys = list(group.keys())
+            for i, key in enumerate(keys):
+                is_last = i == len(keys) - 1
+                branch = "└── " if is_last else "├── "
+                child = group[key]
+                if isinstance(child, h5py.Dataset):
+                    print(f"{prefix}{branch}{key} (shape={child.shape}, dtype={child.dtype})")
+                else:
+                    print(f"{prefix}{branch}{key}/")
+                    next_prefix = prefix + ("    " if is_last else "│   ")
+                    _print_group(child, next_prefix)
+
+        _print_group(demo_grp, "    ")
+
 # ---------- main conversion --------------------------------------------------
 def build_hdf5_from_npz(demos_dir: Path, h5_path: Path):
     with h5py.File(h5_path, "w") as hf:
@@ -68,6 +106,21 @@ def build_hdf5_from_npz(demos_dir: Path, h5_path: Path):
                 obs_grp.create_dataset("images_0_depth", data=depth_frames[:-1], compression="gzip")
             else:
                 print(f"[WARN] {npz_path.name} missing 'images_0_depth'")
+
+            # external camera images ------------------------------------------
+            if "images_1" in data.files:
+                ext_frames = [img.astype(np.uint8) for img in data["images_1"]]
+                ext_frames = np.stack(ext_frames, axis=0)  # (N,H,W,3)
+                obs_grp.create_dataset("images_1", data=ext_frames[:-1], compression="gzip")
+            else:
+                print(f"[WARN] {npz_path.name} missing 'images_1'")
+
+            if "images_1_depth" in data.files:
+                ext_depth_frames = [img.astype(np.uint16) for img in data["images_1_depth"]]
+                ext_depth_frames = np.stack(ext_depth_frames, axis=0)  # (N,H,W)
+                obs_grp.create_dataset("images_1_depth", data=ext_depth_frames[:-1], compression="gzip")
+            else:
+                print(f"[WARN] {npz_path.name} missing 'images_1_depth'")
 
             # split pose -------------------------------------------------------
             eef_pose   = data["ee_pose"].astype(np.float32)  # (N,7)
@@ -134,4 +187,5 @@ if __name__ == "__main__":
         sys.exit(1)
 
     build_hdf5_from_npz(demos_folder, output_h5)
+    print_first_demo_tree(output_h5)
     print(f"\nAll demos written to {output_h5}")
